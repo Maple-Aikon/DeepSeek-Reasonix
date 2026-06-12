@@ -49,6 +49,9 @@ node_modules/
 # CodeGraph per-project index (rebuilt locally; never committed)
 .codegraph/
 
+# Benchmarks scratch (e2e run output, regenerated)
+benchmarks/context-maintenance-e2e/run/
+
 # Editor / OS
 .DS_Store
 Thumbs.db
@@ -56,4 +59,18 @@ Thumbs.db
 .vscode/
 /site/public/av/
 
-benchmarks/context-maintenance-e2e/run/
+# Scratch / agent working dirs (never committed)
+/tmp/
+/.codex/
+
+# Local build artifacts (not in repo)
+.build-pid
+build-*.log
+adapter-tmp/
+
+# Python (per-adapter: venv, caches)
+adapter/.venv/
+adapter/__pycache__/
+**/__pycache__/
+**/.pytest_cache/
+adapter/.pytest_cache/
