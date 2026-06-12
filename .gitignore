@@ -58,3 +58,15 @@ Thumbs.db
 # Scratch / agent working dirs (never committed)
 /tmp/
 /.codex/
+
+# Local build artifacts (not in repo)
+.build-pid
+build-*.log
+adapter-tmp/
+
+# Python (per-adapter: venv, caches)
+adapter/.venv/
+adapter/__pycache__/
+**/__pycache__/
+**/.pytest_cache/
+adapter/.pytest_cache/
