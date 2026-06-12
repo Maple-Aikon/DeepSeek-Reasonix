@@ -51,6 +51,9 @@ node_modules/
 # CodeGraph per-project index (rebuilt locally; never committed)
 .codegraph/
 
+# Benchmarks scratch (e2e run output, regenerated)
+benchmarks/context-maintenance-e2e/run/
+
 # Editor / OS
 .DS_Store
 Thumbs.db
