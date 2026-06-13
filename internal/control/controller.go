@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2248,23 +2249,55 @@ func (c *Controller) connectCodegraphMCPServer(cfg *config.Config) (int, error) 
 	if !ok {
 		return 0, fmt.Errorf("codegraph is not installed")
 	}
-	cwd, err := os.Getwd()
+	indexRoot, err := codegraphIndexRoot()
 	if err != nil {
 		return 0, err
 	}
-	if !codegraph.IndexableRoot(cwd) {
-		return 0, fmt.Errorf("codegraph: refusing to index %q — a filesystem root would index the whole volume", cwd)
+	if !codegraph.IndexableRoot(indexRoot) {
+		return 0, fmt.Errorf("codegraph: refusing to index %q — a filesystem root would index the whole volume", indexRoot)
 	}
-	if err := codegraph.EnsureInit(c.pluginCtx, bin, cwd); err != nil {
+	if err := codegraph.EnsureInit(c.pluginCtx, bin, indexRoot); err != nil {
 		return 0, fmt.Errorf("codegraph init: %w", err)
 	}
 	return c.connectMCPSpec(plugin.Spec{
-		Name:              "codegraph",
-		Command:           bin,
-		Args:              []string{"serve", "--mcp"},
-		Dir:               cwd,
+		Name:    "codegraph",
+		Command: bin,
+		// --no-watch avoids the chokidar ENOSPC storm seen on 2026-06-12
+		// (workspace has millions of files in apps/, sources/llama.cpp/.git/,
+		// and node_modules). We don't need codegraph's auto-sync because the
+		// parent index rebuilds on its own change-detection. -p <indexRoot>
+		// is defense-in-depth: even if Dir is wrong, codegraph reads --path
+		// (bin/codegraph.js:1022) and ignores the cwd mismatch.
+		Args:              []string{"serve", "--mcp", "--no-watch", "-p", indexRoot},
+		Dir:               indexRoot,
 		ReadOnlyToolNames: codegraph.ReadOnlyToolNames(),
 	})
+}
+
+// codegraphIndexRoot resolves the directory the codegraph MCP server should
+// index. The root MUST be set explicitly via the REASONIX_CODEGRAPH_ROOT env
+// var — there is no implicit default, so a forgotten env produces a clear
+// startup error rather than silently indexing the workspace root.
+//
+// Resolution order (highest to lowest):
+//
+//	1. $REASONIX_CODEGRAPH_ROOT, after strings.TrimSpace (whitespace is treated
+//	   as unset), resolved to an absolute path.
+//	2. Error: env unset, empty, or whitespace-only.
+//
+// The env override exists so a single binary can be pointed at different
+// project roots in tests, CI, and on machines with non-standard layouts
+// without recompiling.
+func codegraphIndexRoot() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("REASONIX_CODEGRAPH_ROOT"))
+	if raw == "" {
+		return "", fmt.Errorf("codegraph: REASONIX_CODEGRAPH_ROOT env is not set — refusing to index the workspace root; set it to the directory codegraph should index (e.g. /home/maple/.picoclaw/workspace/sources)")
+	}
+	abs, err := filepath.Abs(raw)
+	if err != nil {
+		return "", fmt.Errorf("codegraph: REASONIX_CODEGRAPH_ROOT=%q: %w", raw, err)
+	}
+	return abs, nil
 }
 
 // RemoveMCPServer disconnects a live MCP server — its tools vanish from the next
