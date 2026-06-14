@@ -83,6 +83,7 @@ func Serve(ctx context.Context, r io.Reader, w io.Writer, factory Factory, info 
 	conn.Handle("session/close", svc.sessionClose)
 	conn.Handle("session/list", svc.sessionList)
 	conn.Handle("session/delete", svc.sessionDelete)
+	conn.Handle("session/steer", svc.sessionSteer)
 	conn.HandleNotify("session/cancel", svc.sessionCancel)
 	defer svc.closeAll()
 	return conn.Serve(ctx)
@@ -432,6 +433,30 @@ func (s *service) sessionClose(_ context.Context, raw json.RawMessage) (any, err
 		sess.ctrl.Close()
 	}
 	return SessionCloseResult{}, nil
+}
+
+// sessionSteer injects mid-turn guidance into a running turn. The agent queues
+// the text and consumes it after the current step completes. If the agent is
+// not currently running a turn, Controller.Steer converts the text into a new
+// user message and submits it — clients should not rely on a strict "must be
+// mid-turn" guarantee and should poll reasonix_status to confirm.
+func (s *service) sessionSteer(_ context.Context, raw json.RawMessage) (any, error) {
+	var p SessionSteerParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &RPCError{Code: ErrInvalidParams, Message: "session/steer: " + err.Error()}
+	}
+	if err := validateSessionID("session/steer", p.SessionID); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(p.Text) == "" {
+		return nil, &RPCError{Code: ErrInvalidParams, Message: "session/steer: text is required"}
+	}
+	sess := s.session(p.SessionID)
+	if sess == nil {
+		return nil, &RPCError{Code: ErrInvalidParams, Message: "session/steer: unknown session id"}
+	}
+	sess.ctrl.Steer(p.Text)
+	return SessionSteerResult{Queued: true, QueueLen: sess.ctrl.SteerQueueLen()}, nil
 }
 
 // sessionList returns ACP sessions known to this process or persisted as ACP

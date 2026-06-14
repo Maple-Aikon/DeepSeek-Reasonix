@@ -1191,6 +1191,20 @@ func (c *Controller) SteerConsumed() bool {
 	return true
 }
 
+// SteerQueueLen returns the number of mid-turn steer messages currently
+// queued for the executor. Returns 0 when the controller has no live
+// executor (e.g. during session/shutdown). Callers — typically the ACP
+// session/steer handler — use this to expose queue depth to clients.
+func (c *Controller) SteerQueueLen() int {
+	c.mu.Lock()
+	exec := c.executor
+	c.mu.Unlock()
+	if exec == nil {
+		return 0
+	}
+	return exec.SteerQueueLen()
+}
+
 // Ask implements agent.Asker: it emits an AskRequest and blocks until
 // AnswerQuestion(ID, …) answers or ctx is cancelled. promptMu serialises it
 // against tool-approval prompts so at most one user prompt is outstanding.

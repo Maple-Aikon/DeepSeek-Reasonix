@@ -413,6 +413,11 @@ func (a *Agent) steerQueueLen() int {
 	return len(a.steerQueue)
 }
 
+// SteerQueueLen returns the number of mid-turn steer messages currently
+// queued for the agent. Public counterpart of steerQueueLen for callers
+// outside the agent package (e.g. internal/control.Controller).
+func (a *Agent) SteerQueueLen() int { return a.steerQueueLen() }
+
 // CompactRatio returns the fraction of the window at which auto-compaction
 // fires (e.g. 0.8). The status line uses it to show headroom to the next compact.
 func (a *Agent) CompactRatio() float64 { return a.compactRatio }
