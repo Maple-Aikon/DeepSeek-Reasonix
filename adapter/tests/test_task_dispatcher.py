@@ -4,11 +4,11 @@ Strategy
 --------
 TaskDispatcher wraps a Supervisor + LogCapture pair, plus a session
 registry. It exposes 5 high-level methods:
-  - dispatch(task)  : start a session, send prompt, return stop payload
-  - cancel(sid)     : cancel an in-flight session
-  - steer(sid, new) : cancel + dispatch(new) on the same supervisor
-  - status(sid, n)  : return last N events from the NDJSON log
-  - replay(sid)     : return all events from the NDJSON log
+  - dispatch(task)   : start a session, send prompt, return stop payload
+  - cancel(sid)      : cancel an in-flight session
+  - steer(sid, text) : queue mid-turn guidance via session/steer (no cancel)
+  - status(sid, n)   : return last N events from the NDJSON log
+  - replay(sid)      : return all events from the NDJSON log
 
 All tests use a **StubSupervisor** that mimics the public surface
 (``start``, ``new_session``, ``prompt``, ``cancel``, ``close``, plus
@@ -67,6 +67,7 @@ class StubSupervisor:
         self.prompt_calls: list[tuple[str, list]] = []
         self.cancel_calls: list[str] = []
         self.new_session_calls: list[str] = []
+        self.steer_calls: list[tuple[str, str]] = []
         self.start_calls = 0
         self.close_calls = 0
 
@@ -116,6 +117,12 @@ class StubSupervisor:
             "method": "session/update",
             "params": {"sessionId": sid, "sessionUpdate": "stop", "stopReason": "cancelled"},
         })
+
+    async def steer(self, sid: str, text: str) -> dict:
+        """Stub: record the call and return a deterministic result.
+        Mirrors the real ``Supervisor.steer`` contract (P2.1)."""
+        self.steer_calls.append((sid, text))
+        return {"queued": True}
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -242,24 +249,30 @@ async def test_cancel_sends_session_cancel(tmp_dirs):
     assert stop_records[0]["params"]["stopReason"] == "cancelled"
 
 
-# ---------------- Test 4: steer cancels + re-prompts with new task ----------------
+# ---------------- Test 4: steer queues mid-turn guidance (no cancel) ----------------
 
 
-async def test_steer_sends_new_prompt(tmp_dirs):
+async def test_steer_queues_midturn_guidance(tmp_dirs):
+    """``steer`` calls the ``session/steer`` wire method on the supervisor
+    and does NOT cancel the in-flight turn (mid-turn inject semantics
+    added in P2.1). The previous Phase 1 behavior (cancel + re-prompt)
+    is gone — callers wanting that should use ``cancel`` + ``dispatch``
+    explicitly.
+    """
     TaskDispatcher, _ = _import_or_skip()
     sup = StubSupervisor(sid="s-4")
     cap = FakeLogCapture()
     td = TaskDispatcher(supervisor=sup, log_capture=cap, cwd=tmp_dirs["cwd"])
 
-    await td.steer("s-4", "different direction")
+    result = await td.steer("s-4", "refine your answer with more detail")
 
-    # Cancel was called first
-    assert sup.cancel_calls == ["s-4"]
-    # Then a new prompt with the new task
-    assert len(sup.prompt_calls) == 1
-    sid_arg, content_arg = sup.prompt_calls[0]
-    assert sid_arg == "s-4"
-    assert content_arg == [{"type": "text", "text": "different direction"}]
+    # steer was forwarded to the supervisor's steer() method
+    assert sup.steer_calls == [("s-4", "refine your answer with more detail")]
+    # No cancel and no new prompt — those are now distinct operations
+    assert sup.cancel_calls == []
+    assert sup.prompt_calls == []
+    # Returns the supervisor's steer result verbatim
+    assert result == {"queued": True}
 
 
 # ---------------- Test 5: status returns last N events from log file ----------------
