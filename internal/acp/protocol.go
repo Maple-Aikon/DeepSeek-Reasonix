@@ -509,3 +509,24 @@ type PermissionOutcome struct {
 	Outcome  string `json:"outcome"`
 	OptionID string `json:"optionId,omitempty"`
 }
+
+// --- session/steer (client → agent request) ---
+//
+// SessionSteerParams injects a mid-turn guidance message into a running turn.
+// The model sees the message after the current step; if no turn is running, the
+// agent re-prompts with the text as a new user message. Client receives
+// SessionSteerResult immediately — steering is fire-and-forget queue work.
+type SessionSteerParams struct {
+	SessionID string `json:"sessionId"`
+	Text      string `json:"text"`
+}
+
+// SessionSteerResult reports the outcome. QueueLen is the depth of the agent's
+// internal mid-turn queue AFTER this steer was enqueued, so clients can show
+// "queued behind N other items" UI. Note: queue length is exposed for callers
+// that need it for back-pressure heuristics, but it is not a public Agent
+// field — see the `steerQueueLen` accessor in internal/agent.
+type SessionSteerResult struct {
+	Queued   bool `json:"queued"`
+	QueueLen int  `json:"queueLen"`
+}
