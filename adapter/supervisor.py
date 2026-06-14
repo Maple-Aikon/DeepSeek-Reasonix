@@ -372,6 +372,34 @@ class Supervisor:
         except ConnError as e:
             log.warning("cancel notify failed (process likely already gone): %s", e)
 
+    async def steer(self, sid: str, text: str) -> dict:
+        """Queue ``text`` as mid-turn guidance on session ``sid``.
+
+        Wraps the ``session/steer`` ACP method (added in P2.1). The
+        binary's Controller.Steer() appends ``text`` to a FIFO queue
+        that the executor consumes after the current step completes
+        — it does NOT cancel the in-flight turn. If no turn is running
+        (e.g. caller raced ahead of a previous prompt), the controller
+        converts the text into a fresh user message and submits it.
+
+        Returns the JSON-RPC result (currently empty per the wire
+        spec; reserved for future fields like ``consumedAt``).
+
+        Raises :class:`SupervisorError` if the transport fails or
+        :class:`JSONRPCError` for server-side validation errors
+        (unknown session, empty text, etc.).
+        """
+        self._require_state("ready")
+        # Steer is valid whether or not a turn is currently running —
+        # the controller handles both cases. We only require that the
+        # supervisor itself is ready (subprocess is alive and past
+        # initialize).
+        result = await self._conn.request(
+            "session/steer",
+            params={"sessionId": sid, "text": text},
+        )
+        return result if isinstance(result, dict) else {}
+
     async def close(self) -> None:
         """Graceful shutdown: cancel any in-flight prompt, drain
         pipes, terminate. Idempotent — calling twice is a no-op."""

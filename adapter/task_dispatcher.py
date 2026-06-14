@@ -6,7 +6,7 @@ It composes a :class:`adapter.supervisor.Supervisor` and a
 
     dispatch(task)        — start a session, prompt, return stop payload
     cancel(sid)           — best-effort cancel of an in-flight session
-    steer(sid, new_task)  — cancel + re-prompt with the new task
+    steer(sid, text)     — queue mid-turn guidance (no cancel) via session/steer
     status(sid, n=20)     — return the last N events from the NDJSON log
     replay(sid)           — async-iterate over the entire NDJSON log
 
@@ -74,6 +74,7 @@ class SupervisorLike(Protocol):
     async def new_session(self, cwd: str) -> dict: ...
     async def prompt(self, sid: str, content: list) -> dict: ...
     async def cancel(self, sid: str) -> None: ...
+    async def steer(self, sid: str, text: str) -> dict: ...
     async def close(self) -> None: ...
     @property
     def on_notification(self) -> Any: ...
@@ -200,16 +201,30 @@ class TaskDispatcher:
         supervisor was already idle."""
         await self._sup.cancel(sid)
 
-    async def steer(self, sid: str, new_task: str) -> dict:
-        """Cancel ``sid`` and immediately re-prompt with ``new_task``.
+    async def steer(self, sid: str, text: str) -> dict:
+        """Queue ``text`` as mid-turn guidance on session ``sid``.
 
-        Why not a true fork/rewind? Phase 1 reasonix doesn't expose
-        ``session/fork`` or ``session/rewind`` over ACP (see plan §"Goal
-        & scope" §"Critical scope"). The soft-steer (cancel + new
-        prompt) is the closest equivalent.
+        Thin wrapper over :meth:`Supervisor.steer`, which calls the
+        ``session/steer`` ACP method (added in P2.1). The binary's
+        Controller.Steer() appends ``text`` to a FIFO queue that the
+        executor consumes after the current step completes — it does
+        NOT cancel the in-flight turn, so the agent sees both the
+        original prompt and the steered text.
+
+        This is the proper "steer" semantics; if you need to restart
+        the turn with a different task instead, cancel first and then
+        dispatch a new prompt:
+
+            await td.cancel(sid)
+            await td.dispatch("entirely new task")
+
+        Returns the server's steer result dict (currently empty).
+        Raises :class:`TaskDispatcherError` on transport failure.
         """
-        await self.cancel(sid)
-        return await self.dispatch(new_task)
+        try:
+            return await self._sup.steer(sid, text)
+        except Exception as e:
+            raise TaskDispatcherError(f"steer failed: {e}") from e
 
     async def status(self, sid: str, n: int = 20) -> list[dict]:
         """Return the last ``n`` events from ``<log_dir>/<sid>.jsonl``.
