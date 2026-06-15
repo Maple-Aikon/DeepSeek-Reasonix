@@ -29,6 +29,7 @@ The tool is registered with the MCP server in ``adapter/mcp_server.py``
 from __future__ import annotations
 
 import logging
+import json
 import os
 import secrets
 import tempfile
@@ -233,6 +234,11 @@ class DelegateDispatcher:
         # so concurrent "approve" calls for different sessions don't race.
         self._pending_approves: dict[str, dict] = {}
 
+        # R9: Session map. sid -> SessionRecord (see SessionRecord below).
+        # Populated in dispatch(), read by status() / replay(). Cleared
+        # in close() (and naturally bounded by Reasonix session lifetime).
+        self._sessions: dict[str, "SessionRecord"] = {}
+
         # If a log_capture was provided, wire it as the supervisor's
         # notification handler. This is the same pattern TaskDispatcher
         # uses (L174 in task_dispatcher.py). If the supervisor is a
@@ -301,6 +307,22 @@ class DelegateDispatcher:
         # or the transcript doesn't exist yet.
         cost = self._snapshot_cost_for(sid)
 
+        # R9: Record session in the dispatcher's session map so status()
+        # and replay() can return authoritative metadata without
+        # re-deriving from the binary. We do this AFTER prompt() so
+        # the session id is definitely real (not just new_session's
+        # pre-prompt return value).
+        import time as _time
+        self._sessions[sid] = {
+            "created_at": _time.time(),
+            "persona_name": resolved.name,
+            "plan_mode": plan_mode,
+            "cwd": cwd,
+            "log_path": str(self._log_path(sid)),
+            "status": "completed",  # end-of-turn reached
+            "prompt_preview": prompt[:80],
+        }
+
         return {
             "sid": sid,
             "log_path": str(self._log_path(sid)),
@@ -343,12 +365,176 @@ class DelegateDispatcher:
         slot["event"].set()
         return True
 
+    # ---- R9: status + replay ----
+
+    def status(self, sid: str) -> dict:
+        """Return a status snapshot for ``sid``.
+
+        The shape mirrors the MCP tool contract (see :mod:`phase2-spec.md`
+        §P2.2 base MCP tools — ``reasonix_status``). For sessions
+        dispatched via this dispatcher the returned dict has:
+
+          - ``sid`` (str): the session id
+          - ``status`` (str): one of ``"running"`` / ``"paused"``
+            (plan_mode=approve waiting for on_approve) / ``"completed"``
+            (no in-flight prompt) / ``"unknown"`` (sid not in our map)
+          - ``persona`` (str): resolved persona name (e.g. ``"scaffold"``)
+          - ``plan_mode`` (str): one of ``"auto"`` / ``"skip"`` /
+            ``"approve"``
+          - ``cost`` (dict): 5-field shape from
+            :class:`adapter.cost.CostBreakdown.to_dict`
+          - ``last_event`` (dict | None): the most recent NDJSON record
+            from the session's transcript, or None if the log doesn't
+            exist yet
+          - ``queue_len`` (int): best-effort estimate of pending
+            notifications (0 when we can't tell — we don't subscribe to
+            the binary's internal queue from the adapter)
+          - ``created_at`` (float): unix timestamp of the dispatch
+          - ``prompt_preview`` (str): first 80 chars of the original
+            prompt (handy for log display)
+          - ``log_path`` (str): absolute path to the NDJSON transcript
+
+        For unknown sids the shape is::
+
+            {"sid": "<unknown>", "status": "unknown", "cost": {zero 5-field}}
+
+        This method is sync (no I/O beyond the transcript read, which
+        is best-effort and tolerates missing files) so the MCP layer
+        can call it from any context.
+        """
+        from adapter.cost import CostBreakdown
+
+        if sid not in self._sessions:
+            return {
+                "sid": sid,
+                "status": "unknown",
+                "persona": None,
+                "plan_mode": None,
+                "cost": CostBreakdown().to_dict(),
+                "last_event": None,
+                "queue_len": 0,
+                "created_at": 0.0,
+                "prompt_preview": "",
+                "log_path": str(self._log_path(sid)),
+            }
+
+        rec = self._sessions[sid]
+        # Best-effort last_event from the tail of the log. We don't
+        # require the file to exist — if it doesn't, last_event=None.
+        last_event = self._tail_last_event(sid)
+        # Best-effort queue_len. We have no direct visibility into
+        # the binary's internal queue; we report the number of
+        # pending "approve" slots (1 if this sid is paused) plus 0
+        # otherwise. A future P2.4 / P3.x iteration can surface
+        # Agent.steerQueueLen() if exposed upstream.
+        queue_len = 1 if sid in self._pending_approves else 0
+        # Current status: paused if waiting for approve, otherwise
+        # the dispatcher thinks it's running. We don't poll the
+        # binary for completion here (that's a future enhancement).
+        current_status = "paused" if queue_len > 0 else rec.get("status", "running")
+
+        return {
+            "sid": sid,
+            "status": current_status,
+            "persona": rec.get("persona_name"),
+            "plan_mode": rec.get("plan_mode"),
+            "cost": self._snapshot_cost_for(sid).to_dict(),
+            "last_event": last_event,
+            "queue_len": queue_len,
+            "created_at": rec.get("created_at", 0.0),
+            "prompt_preview": rec.get("prompt_preview", ""),
+            "log_path": rec.get("log_path", str(self._log_path(sid))),
+        }
+
+    def replay(self, sid: str, since_seq: int = 0) -> list[dict]:
+        """Return transcript events for ``sid`` with seq >= ``since_seq``.
+
+        Events are the raw NDJSON records written by :class:`LogCapture`
+        to ``<log_dir>/<sid>.jsonl``. Lines that fail to parse are
+        skipped silently (forward-compatible with new record shapes
+        the upstream may add).
+
+        Args:
+            sid: session id returned by a previous :meth:`dispatch` call.
+            since_seq: only return events with ``seq >= since_seq``.
+                Default 0 = all events. Events without a ``seq`` field
+                are included only when ``since_seq == 0`` (treat as
+                seq=0 for filter purposes).
+
+        Returns:
+            list of dicts. ``[]`` if the log file doesn't exist or the
+            session is unknown. Filtering by ``since_seq`` is a soft
+            filter — events without a ``seq`` field are returned when
+            ``since_seq == 0`` and skipped otherwise (we don't want
+            to re-emit unknown-shape records on every poll).
+        """
+        from adapter.cost import UsageAccumulator
+
+        log_path = self._log_path(sid)
+        if not log_path.exists():
+            return []
+        try:
+            # Off-load blocking I/O to a thread; this can return a
+            # large list for long sessions.
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        events: list[dict] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            seq = rec.get("seq")
+            if since_seq == 0:
+                events.append(rec)
+            elif isinstance(seq, int) and seq >= since_seq:
+                events.append(rec)
+            # else: seq missing or below threshold, skip
+        return events
+
+    def _tail_last_event(self, sid: str, n: int = 1) -> Optional[dict]:
+        """Read the last ``n`` events from the session's transcript.
+
+        Returns None if the log doesn't exist. Best-effort: used by
+        :meth:`status` to populate the ``last_event`` field. Off-loads
+        the file read to a thread.
+        """
+        log_path = self._log_path(sid)
+        if not log_path.exists():
+            return None
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        events: list[dict] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if not events:
+            return None
+        return events[-1] if n == 1 else events[-n:]
+
     async def close(self) -> None:
         """Close the log_capture (if attached) so its background
         threads shut down cleanly. Mirrors TaskDispatcher.close.
 
         Idempotent: safe to call multiple times.
+
+        R9: Also clears the in-memory session map. Callers should
+        not assume session metadata survives a close.
         """
+        # R9: drop session map first so any in-flight status() call
+        # returns "unknown" instead of stale data.
+        self._sessions.clear()
         if self._cap is None:
             return
         try:
@@ -417,6 +603,22 @@ class DelegateDispatcher:
                     sid, content=[{"type": "text", "text": followup}],
                 )
                 cost = self._snapshot_cost_for(sid)
+
+            # R9: Record final session state in the map. Status is
+            # "completed" (executor ran to end-of-turn) for approve,
+            # "rejected" for explicit reject / auto-timeout.
+            import time as _time
+            final_status = "completed" if decision == "approve" else "rejected"
+            self._sessions[sid] = {
+                "created_at": _time.time(),
+                "persona_name": resolved.name,
+                "plan_mode": plan_mode,
+                "cwd": cwd,
+                "log_path": str(self._log_path(sid)),
+                "status": final_status,
+                "prompt_preview": prompt[:80],
+                "decision": decision,
+            }
 
             return {
                 "sid": sid,
