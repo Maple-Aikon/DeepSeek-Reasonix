@@ -29,7 +29,8 @@ func TestCodegraphIndexRoot(t *testing.T) {
 		envValue  string
 		wantErr   bool
 		errSubstr string
-		wantPath  string // exact absolute path expected; only checked when !wantErr
+		wantPath    string // exact absolute path expected; only checked when !wantErr
+		wantAbsOnly bool   // if true, assert result is absolute (no exact match)
 	}{
 		{
 			name:     "absolute path passes through",
@@ -40,32 +41,32 @@ func TestCodegraphIndexRoot(t *testing.T) {
 			wantPath: func() string { p, _ := filepath.Abs("/tmp/codegraph-test"); return p }(),
 		},
 		{
-			name:     "relative path is resolved to absolute",
+			name:        "relative path is resolved to absolute",
+			setEnv:      true,
+			envValue:    "rel/path",
+			wantAbsOnly: true, // see post-check switch
+		},
+		{
+			// REASONIX_FORK: post-v1.8.0 merge, codegraphIndexRoot is permissive
+			// when the env is unset/empty/whitespace (returns "", nil). PicoClaw's
+			// wrapper always sets the env, so the wrapper path keeps its strict
+			// pinning; the legacy connectCodegraphMCPServer(cfg) path falls back
+			// to cwd when the env is missing (v1.8.0 test contract).
+			name:     "unset env falls back to empty path (no error)",
+			setEnv:   false,
+			wantPath: "",
+		},
+		{
+			name:     "empty env treated as unset (no error)",
 			setEnv:   true,
-			envValue: "rel/path",
-			// We don't pin the cwd; just assert the result is absolute.
-			// wantPath is checked separately as "must be absolute".
-			wantPath: "", // sentinel: see post-check
+			envValue: "",
+			wantPath: "",
 		},
 		{
-			name:      "unset env errors with helpful message",
-			setEnv:    false,
-			wantErr:   true,
-			errSubstr: "REASONIX_CODEGRAPH_ROOT env is not set",
-		},
-		{
-			name:      "empty env errors with helpful message",
-			setEnv:    true,
-			envValue:  "",
-			wantErr:   true,
-			errSubstr: "REASONIX_CODEGRAPH_ROOT env is not set",
-		},
-		{
-			name:      "whitespace-only env treated as unset",
-			setEnv:    true,
-			envValue:  "   \t  ",
-			wantErr:   true,
-			errSubstr: "REASONIX_CODEGRAPH_ROOT env is not set",
+			name:     "whitespace-only env treated as unset (no error)",
+			setEnv:   true,
+			envValue: "   \t  ",
+			wantPath: "",
 		},
 	}
 
@@ -92,14 +93,23 @@ func TestCodegraphIndexRoot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if tc.wantPath != "" {
-				if got != tc.wantPath {
-					t.Fatalf("path mismatch: got %q want %q", got, tc.wantPath)
+			// Three post-check branches:
+			//   - tc.wantPath == "" (sentinel): helper must return "" (no path)
+			//   - tc.wantPath is absolute: exact match
+			//   - tc.wantPath == "" in the struct but with the abs-check sentinel:
+			//     handled separately via wantAbsOnly flag
+			switch {
+			case tc.wantPath == "" && !tc.wantAbsOnly:
+				if got != "" {
+					t.Fatalf("expected empty path, got %q", got)
 				}
-			} else {
-				// relative-path case: must be resolved to absolute
+			case tc.wantAbsOnly:
 				if !filepath.IsAbs(got) {
 					t.Fatalf("relative env did not resolve to absolute: got %q", got)
+				}
+			default:
+				if got != tc.wantPath {
+					t.Fatalf("path mismatch: got %q want %q", got, tc.wantPath)
 				}
 			}
 		})
