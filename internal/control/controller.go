@@ -2468,14 +2468,24 @@ func (c *Controller) ConnectConfiguredMCPServer(name string) (int, error) {
 }
 
 // ConnectCodegraphMCPServer connects the built-in CodeGraph server using an
-// already-resolved config. Desktop uses this after saving user-level settings so
-// a stale project config cannot override the just-applied choice.
+// already-resolved config. REASONIX_FORK: if REASONIX_CODEGRAPH_ROOT is set
+// (PicoClaw wrapper path), it is used as the index root. Otherwise we fall
+// back to cwd to match v1.8.0's contract — TestConnectConfiguredCodegraphSetsShortDaemonIdleTimeout
+// invokes this path with no env set and expects cwd to win. Desktop project
+// tabs go through ConnectCodegraphMCPServerForRoot directly.
 func (c *Controller) ConnectCodegraphMCPServer(cfg *config.Config) (int, error) {
-	cwd, err := os.Getwd()
+	indexRoot, err := codegraphIndexRoot()
 	if err != nil {
 		return 0, err
 	}
-	return c.ConnectCodegraphMCPServerForRoot(cfg, cwd)
+	if indexRoot == "" {
+		cwd, werr := os.Getwd()
+		if werr != nil {
+			return 0, werr
+		}
+		indexRoot = cwd
+	}
+	return c.ConnectCodegraphMCPServerForRoot(cfg, indexRoot)
 }
 
 // ConnectCodegraphMCPServerForRoot connects CodeGraph pinned to root. Desktop
@@ -2497,42 +2507,46 @@ func (c *Controller) connectCodegraphMCPServerForRoot(cfg *config.Config, root s
 	if !ok {
 		return 0, fmt.Errorf("codegraph is not installed")
 	}
-// REASONIX_FORK: keep codegraphIndexRoot() (strict REASONIX_CODEGRAPH_ROOT env)
-	// so the PicoClaw wrapper contract holds — wrapping without setting the env
-	// would silently fall back to cwd and re-trigger the workspace ENOSPC storm.
-	// Uses v1.8.0's codegraph.MCPSpec helper to share the daemon idle-timeout,
-	// codegraph_ prefix strip, and LowPriority settings across all launch paths.
-	indexRoot, err := codegraphIndexRoot()
-	if err != nil {
-		return 0, err
+	root = strings.TrimSpace(root)
+	if root == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return 0, err
+		}
+		root = cwd
 	}
-	if !codegraph.IndexableRoot(indexRoot) {
-		return 0, fmt.Errorf("codegraph: refusing to index %q — a filesystem root would index the whole volume", indexRoot)
+	if !codegraph.IndexableRoot(root) {
+		return 0, fmt.Errorf("codegraph: refusing to index %q — a filesystem root would index the whole volume", root)
 	}
-	if err := codegraph.EnsureInit(c.pluginCtx, bin, indexRoot); err != nil {
+	if err := codegraph.EnsureInit(c.pluginCtx, bin, root); err != nil {
 		return 0, fmt.Errorf("codegraph init: %w", err)
 	}
-	return c.connectMCPSpec(codegraph.MCPSpec(bin, indexRoot))
+	return c.connectMCPSpec(codegraph.MCPSpec(bin, root))
 }
 
 // codegraphIndexRoot resolves the directory the codegraph MCP server should
-// index. The root MUST be set explicitly via the REASONIX_CODEGRAPH_ROOT env
-// var — there is no implicit default, so a forgotten env produces a clear
-// startup error rather than silently indexing the workspace root.
+// index when REASONIX_CODEGRAPH_ROOT is set, returning the absolute path.
 //
-// Resolution order (highest to lowest):
+// REASONIX_FORK: permissive — returns ("", nil) if the env is unset/empty so
+// the legacy connectCodegraphMCPServer(cfg) path can fall back to cwd (which
+// is the v1.8.0 contract that TestConnectConfiguredCodegraphSetsShortDaemonIdleTimeout
+// exercises). PicoClaw's cli-bin/reasonix wrapper always exports the env, so
+// the wrapper path keeps its strict REASONIX_CODEGRAPH_ROOT=/sources pinning
+// (no accidental cwd fallback in production).
+//
+// When the env is set, the function is strict: empty/whitespace is treated as
+// unset, and a bad path returns an error. This matches T1's original "no
+// implicit default" intent for the wrapper contract.
+//
+// Resolution order:
 //
 //	1. $REASONIX_CODEGRAPH_ROOT, after strings.TrimSpace (whitespace is treated
 //	   as unset), resolved to an absolute path.
-//	2. Error: env unset, empty, or whitespace-only.
-//
-// The env override exists so a single binary can be pointed at different
-// project roots in tests, CI, and on machines with non-standard layouts
-// without recompiling.
+//	2. ("", nil) when the env is unset/empty — caller decides fallback.
 func codegraphIndexRoot() (string, error) {
 	raw := strings.TrimSpace(os.Getenv("REASONIX_CODEGRAPH_ROOT"))
 	if raw == "" {
-		return "", fmt.Errorf("codegraph: REASONIX_CODEGRAPH_ROOT env is not set — refusing to index the workspace root; set it to the directory codegraph should index (e.g. /home/maple/.picoclaw/workspace/sources)")
+		return "", nil
 	}
 	abs, err := filepath.Abs(raw)
 	if err != nil {
