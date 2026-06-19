@@ -8,6 +8,12 @@ Strategy:
   is marked with ``@pytest.mark.integration`` so it can be skipped with
   ``-m "not integration"`` during normal runs. It verifies the wire
   shape matches what the actual binary emits.
+
+The ``real_bin`` fixture is shared via ``tests/conftest.py`` — it
+returns a ``RealBin(path, env)`` namedtuple so the test can pass both
+the binary path AND a ``HOME``-pointed env to ``Supervisor``. The env
+contains a minimal ``reasonix.toml`` so the v1.9.1 binary does not
+reject ``session/new`` with ``model 'deepseek-flash' is not configured``.
 """
 from __future__ import annotations
 
@@ -26,9 +32,6 @@ from adapter.supervisor import Supervisor, SupervisorError
 # if it were a binary).
 FAKE_BIN = Path(__file__).parent / "fixtures" / "fake_reasonix.py"
 
-# Path to the real reasonix binary (only present if the repo is built).
-REAL_BIN = Path(__file__).resolve().parent.parent.parent / "bin" / "reasonix"
-
 
 @pytest.fixture
 def fake_bin():
@@ -36,14 +39,6 @@ def fake_bin():
     if not FAKE_BIN.exists():
         pytest.skip(f"fake_reasonix fixture not found at {FAKE_BIN}")
     return FAKE_BIN
-
-
-@pytest.fixture
-def real_bin():
-    """Skip integration tests if the real binary is missing."""
-    if not REAL_BIN.exists():
-        pytest.skip(f"real reasonix binary not found at {REAL_BIN}")
-    return REAL_BIN
 
 
 def _env_for_fake(mode="happy", **extra):
@@ -307,8 +302,9 @@ async def test_integration_real_binary_initialize(real_bin, tmp_path):
     skipped with ``-m "not integration"`` when running unit tests in CI.
     """
     sup = Supervisor(
-        binary=real_bin,
+        binary=real_bin.path,
         cwd=tmp_path,
+        env=real_bin.env,
         stderr_log=tmp_path / "real-stderr.log",
         init_timeout=15.0,
     )
@@ -325,10 +321,17 @@ async def test_integration_real_binary_initialize(real_bin, tmp_path):
 
 @pytest.mark.integration
 async def test_integration_real_binary_new_session(real_bin, tmp_path):
-    """Verify session/new works against the real binary."""
+    """Verify session/new works against the real binary.
+
+    v1.9.1 wire change: ``session/new`` now requires a configured
+    default model. The shared ``real_bin`` fixture (see conftest.py)
+    wires a tmp ``HOME`` with a valid ``reasonix.toml`` so this test
+    only exercises the wire shape, not provider availability.
+    """
     sup = Supervisor(
-        binary=real_bin,
+        binary=real_bin.path,
         cwd=tmp_path,
+        env=real_bin.env,
         stderr_log=tmp_path / "real-stderr.log",
         init_timeout=15.0,
         prompt_timeout=60.0,

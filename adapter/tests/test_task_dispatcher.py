@@ -30,7 +30,6 @@ import asyncio
 import json
 import os
 import time
-from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 import pytest
@@ -411,16 +410,15 @@ async def test_log_validation(tmp_dirs):
 
 
 # ---------------- Integration tests (real binary) ----------------
-
-
-REAL_BIN = Path(__file__).resolve().parent.parent.parent / "bin" / "reasonix"
-
-
-@pytest.fixture
-def real_bin():
-    if not REAL_BIN.exists():
-        pytest.skip(f"real reasonix binary not found at {REAL_BIN}")
-    return REAL_BIN
+#
+# The shared ``real_bin`` fixture lives in ``conftest.py`` and wires
+# ``$HOME=<tmpdir>`` with a pre-populated ``reasonix.toml``. This is
+# required by v1.9.1: ``session/new`` resolves the default model
+# (e.g. ``deepseek-flash``) and refuses to dispatch a prompt against
+# an unconfigured provider. The fixture is namedtuple
+# ``RealBin(path, env)`` so call sites read clearly:
+#
+#     Supervisor(binary=real_bin.path, env=real_bin.env, ...)
 
 
 @pytest.mark.integration
@@ -441,7 +439,9 @@ async def test_real_run_echo_hello(real_bin, tmp_path):
 
     # auto_approve=True — without it, the LLM agent's tool calls
     # would block on session/request_permission and we'd time out.
-    sup = Supervisor(binary=real_bin, cwd=str(tmp_path), auto_approve=True)
+    sup = Supervisor(
+        binary=real_bin.path, cwd=str(tmp_path), env=real_bin.env, auto_approve=True
+    )
     cap = LogCapture(sup, log_dir=tmp_path / "logs", pid_dir=tmp_path / "pids")
     td = TaskDispatcher(supervisor=sup, log_capture=cap, cwd=tmp_path)
 
@@ -465,7 +465,9 @@ async def test_real_start_returns_sid(real_bin, tmp_path):
     from adapter.log_capture import LogCapture
     from adapter.supervisor import Supervisor
 
-    sup = Supervisor(binary=real_bin, cwd=str(tmp_path), auto_approve=True)
+    sup = Supervisor(
+        binary=real_bin.path, cwd=str(tmp_path), env=real_bin.env, auto_approve=True
+    )
     cap = LogCapture(sup, log_dir=tmp_path / "logs", pid_dir=tmp_path / "pids")
     td = TaskDispatcher(supervisor=sup, log_capture=cap, cwd=tmp_path)
 
@@ -487,7 +489,9 @@ async def test_real_cancel_long_task(real_bin, tmp_path):
     from adapter.log_capture import LogCapture
     from adapter.supervisor import Supervisor
 
-    sup = Supervisor(binary=real_bin, cwd=str(tmp_path), auto_approve=True)
+    sup = Supervisor(
+        binary=real_bin.path, cwd=str(tmp_path), env=real_bin.env, auto_approve=True
+    )
     cap = LogCapture(sup, log_dir=tmp_path / "logs", pid_dir=tmp_path / "pids")
     td = TaskDispatcher(supervisor=sup, log_capture=cap, cwd=tmp_path)
 
@@ -513,7 +517,9 @@ async def test_real_steer_replaces_prompt(real_bin, tmp_path):
     from adapter.log_capture import LogCapture
     from adapter.supervisor import Supervisor
 
-    sup = Supervisor(binary=real_bin, cwd=str(tmp_path), auto_approve=True)
+    sup = Supervisor(
+        binary=real_bin.path, cwd=str(tmp_path), env=real_bin.env, auto_approve=True
+    )
     cap = LogCapture(sup, log_dir=tmp_path / "logs", pid_dir=tmp_path / "pids")
     td = TaskDispatcher(supervisor=sup, log_capture=cap, cwd=tmp_path)
 
@@ -540,7 +546,9 @@ async def test_real_replay_prints_log(real_bin, tmp_path):
     from adapter.log_capture import LogCapture
     from adapter.supervisor import Supervisor
 
-    sup = Supervisor(binary=real_bin, cwd=str(tmp_path), auto_approve=True)
+    sup = Supervisor(
+        binary=real_bin.path, cwd=str(tmp_path), env=real_bin.env, auto_approve=True
+    )
     cap = LogCapture(sup, log_dir=tmp_path / "logs", pid_dir=tmp_path / "pids")
     td = TaskDispatcher(supervisor=sup, log_capture=cap, cwd=tmp_path)
 

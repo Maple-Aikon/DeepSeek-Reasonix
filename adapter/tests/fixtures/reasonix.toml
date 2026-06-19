@@ -1,0 +1,24 @@
+# Test fixture: minimal reasonix.toml for integration tests.
+#
+# Required because v1.9.1 binary resolves default_model → provider's
+# default model ("deepseek-flash") at session/new time. Without this
+# config, the binary returns -32603 "model 'deepseek-flash' is not
+# configured" and integration tests fail.
+#
+# The api_base points to a non-existent endpoint because integration
+# tests only need the wire to work up to (and including) session/new.
+# Tests that exercise session/prompt skip when the LLM call fails (no
+# API key / no reachable endpoint) — see R5 in test_supervisor.py.
+#
+# This file is loaded by the binary at startup when HOME is set to
+# the directory containing it. See tests/conftest.py::real_bin.
+
+default_model = "deepseek-flash"
+
+[providers.deepseek-flash]
+type = "litellm"
+api_base = "http://127.0.0.1:1"  # unreachable — tests skip on prompt failure
+api_key = "sk-fixture-placeholder"
+
+[providers.deepseek-flash.models.deepseek-flash]
+type = "chat"
