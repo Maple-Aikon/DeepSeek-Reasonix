@@ -447,7 +447,22 @@ class Supervisor:
         if method == "session/request_permission":
             tool = params.get("toolName") or params.get("name") or "<unknown>"
             log.info("auto-approving session/request_permission tool=%s", tool)
-            return {"outcome": "approved"}
+            # PermissionOutcome is a tagged union (protocol.go:402-450):
+            #   - {"outcome": "approved"}            # short form
+            #   - {"outcome": "declined", ...}       # short form
+            #   - {"outcome": "selected", "optionId": "<id>"}  # long form
+            # v1.9.1's permission request carries an `options` list with
+            # at least one entry (e.g. optionId="allow_once"). The server
+            # accepts the short "approved" form as a synonym for selecting
+            # the first allow option. We emit the long form for clarity
+            # and to stay forward-compatible if the server later stops
+            # accepting the synonym.
+            return {
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "allow_once",
+                }
+            }
         # Unknown server-initiated method. Returning ``None`` would
         # cause Conn to send METHOD_NOT_FOUND, which is the correct
         # behavior. We log a warning so misconfigured clients show up
