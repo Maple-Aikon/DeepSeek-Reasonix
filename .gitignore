@@ -76,3 +76,6 @@ adapter/__pycache__/
 **/__pycache__/
 **/.pytest_cache/
 adapter/.pytest_cache/
+
+# Worktree (per using-git-worktrees skill)
+/.worktrees/
