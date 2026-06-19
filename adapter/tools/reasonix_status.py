@@ -111,25 +111,52 @@ def reasonix_status(sid: str) -> dict:
         }
 
 
-def reasonix_replay(sid: str, since_seq: int = 0) -> list[dict]:
-    """Return transcript events for ``sid`` with seq >= ``since_seq``.
+def reasonix_replay(
+    sid: str,
+    since_seq: int = 0,
+    *,
+    mode: str = "conversation",
+) -> list[dict]:
+    """Return the session transcript for ``sid`` in the requested shape.
 
     Thin wrapper over
     :meth:`adapter.tools.reasonix_delegate.DelegateDispatcher.replay`.
     Same error-handling shape as :func:`reasonix_status`.
 
+    R13.3: 3-mode API. ``mode`` selects the output shape:
+
+      - ``"raw"``: raw NDJSON records from the binary log only (no
+        user prompts; user prompts live in the parallel
+        ``<sid>.dispatcher.jsonl``).
+      - ``"conversation"`` (default): unified timeline merging
+        user prompts (dispatcher log) + assistant text (binary
+        log, chunks concatenated per turn) + tool events
+        (``tool_call`` + ``tool_call_update`` merged by
+        ``toolCallId``). See the dispatcher docstring for the
+        full algorithm.
+      - ``"summary"``: placeholder. Returns ``[]`` for R13.x;
+        R14 will fill in aggregated counts / durations / tokens.
+
     Args:
         sid: session id.
         since_seq: minimum event seq to return. Default 0 = all
-            events. Used by the LLM to poll for incremental updates
-            (track the highest seq it has seen, pass since_seq =
-            last_seen_seq + 1 next time).
+            events. Used by the LLM to poll for incremental
+            updates (track the highest seq it has seen, pass
+            ``since_seq = last_seen_seq + 1`` next time). Only
+            applies to the underlying raw events; for
+            ``mode="conversation"`` this filters binary events
+            before transformation.
+        mode: one of ``"raw"`` / ``"conversation"`` /
+            ``"summary"``. Default ``"conversation"`` (changed
+            from raw in R13.3 — most callers want the merged
+            dialog, not the wire dump).
 
     Returns:
-        list of event dicts (raw NDJSON records). ``[]`` if the log
-        doesn't exist. On missing-dispatcher, returns a single-item
-        list with an error dict so the LLM still sees the failure
-        shape.
+        list of message dicts (shape depends on ``mode``). ``[]``
+        if the log(s) don't exist. On missing-dispatcher, returns
+        a single-item list with an error dict so the LLM still
+        sees the failure shape. On invalid mode, returns a
+        single-item list with ``error="invalid_mode"``.
     """
     with _dispatcher_lock:
         dispatcher = _dispatcher
@@ -143,7 +170,16 @@ def reasonix_replay(sid: str, since_seq: int = 0) -> list[dict]:
             ),
         }]
     try:
-        return dispatcher.replay(sid, since_seq=since_seq)
+        return dispatcher.replay(sid, since_seq=since_seq, mode=mode)
+    except ValueError as e:
+        # R13.3: invalid mode surfaces as a single-item error list
+        # (NOT a raised exception — LLM caller can read the error
+        # without try/except).
+        return [{
+            "sid": sid,
+            "error": "invalid_mode",
+            "message": str(e),
+        }]
     except Exception as e:  # pragma: no cover - defensive
         log.exception("reasonix_replay: dispatcher.replay failed for sid=%s", sid)
         return [{

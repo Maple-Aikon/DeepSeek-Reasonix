@@ -9,7 +9,9 @@ talk to the live dispatcher — a :class:`DelegateDispatcher` or
 Tools exposed (6 total — P2.0 + 1 added in this PR):
   - ``reasonix_delegate(prompt, persona=...)``     — start a session
   - ``reasonix_status(sid)``                        — 5-field cost shape
-  - ``reasonix_replay(sid, since_seq=0)``           — NDJSON events
+  - ``reasonix_replay(sid, since_seq=0, *, mode='conversation')``
+                                                  — merged dialog
+    (``mode='raw'|'conversation'|'summary'``; R13.3)
   - ``reasonix_approve(sid, decision, feedback=?)`` — unblock approval
   - ``reasonix_steer(sid, text)``                   — queue mid-turn guidance
   - ``reasonix_cancel(sid)``                        — stop in-flight turn

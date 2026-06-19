@@ -339,13 +339,46 @@ class TestReplay:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_replay_with_no_log_file_returns_empty(
+    async def test_replay_with_no_log_file_returns_empty_raw(
         self, dispatcher: DelegateDispatcher,
     ):
-        """Dispatch happened but the log_capture didn't write anything."""
+        """R13.3: ``mode="raw"`` (binary log only) returns ``[]`` when
+        the binary log doesn't exist, even if the dispatcher log
+        was written by a previous dispatch. This is the
+        R13.4 contract — the raw stream is the binary stream, not
+        the dispatcher-side journal."""
         await dispatcher.dispatch(prompt="x", plan_mode="auto")
-        result = dispatcher.replay("stub-sid-001")
+        result = dispatcher.replay("stub-sid-001", mode="raw")
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_replay_conversation_returns_user_prompt_when_no_binary_log(
+        self, wired_dispatcher: DelegateDispatcher, stub_log_capture: _StubLogCapture,
+    ):
+        """R13.3: ``mode="conversation"`` (default) merges
+        dispatcher log + binary log. When the binary log is empty
+        but the dispatcher log has the user prompt (always true
+        after a dispatch), the merged timeline contains exactly
+        the user message.
+
+        Uses ``wired_dispatcher`` (not bare ``dispatcher``) so the
+        dispatcher log lands in the per-test ``tmp_path`` — bare
+        ``dispatcher`` would write to the global ``SESSION_LOG_DIR``
+        where stale records from prior tests pollute the result.
+        """
+        await wired_dispatcher.dispatch(prompt="hello world", plan_mode="auto")
+        # Drain the background write task (R13.4 fire-and-forget).
+        path = stub_log_capture._log_dir / "stub-sid-001.dispatcher.jsonl"
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if path.exists() and path.stat().st_size > 0:
+                break
+        result = wired_dispatcher.replay("stub-sid-001")
+        # Default mode == "conversation"; expect 1 user record.
+        user_msgs = [m for m in result if m.get("role") == "user"]
+        assert len(user_msgs) == 1, f"got {len(user_msgs)} user msgs: {user_msgs[:2]}"
+        assert user_msgs[0]["text"] == "hello world"
+        assert user_msgs[0]["turn"] == 1
 
     @pytest.mark.asyncio
     async def test_replay_reads_written_events(
@@ -366,7 +399,11 @@ class TestReplay:
             + json.dumps({"kind": "phase", "text": "executor · executing", "seq": 3}) + "\n",
             encoding="utf-8",
         )
-        events = wired_dispatcher.replay(sid)
+        # R13.3: pass mode="raw" — these tests assert the raw NDJSON
+        # shape (preserved from R1). The new conversation mode merges
+        # binary + dispatcher records; that's exercised in
+        # TestReplayConversation below.
+        events = wired_dispatcher.replay(sid, mode="raw")
         assert len(events) == 3
         assert events[0]["kind"] == "phase"
         assert events[1]["kind"] == "usage"
@@ -389,7 +426,8 @@ class TestReplay:
             + json.dumps({"kind": "phase", "text": "p3", "seq": 3}) + "\n",
             encoding="utf-8",
         )
-        events = wired_dispatcher.replay(sid, since_seq=2)
+        # R13.3: raw mode (see comment in test_replay_reads_written_events).
+        events = wired_dispatcher.replay(sid, since_seq=2, mode="raw")
         assert len(events) == 2
         assert events[0]["text"] == "p2"
         assert events[1]["text"] == "p3"
@@ -411,7 +449,8 @@ class TestReplay:
             + "another-bad-line\n",
             encoding="utf-8",
         )
-        events = wired_dispatcher.replay(sid)
+        # R13.3: raw mode (see comment in test_replay_reads_written_events).
+        events = wired_dispatcher.replay(sid, mode="raw")
         # Only the well-formed line survives
         assert len(events) == 1
         assert events[0]["text"] == "ok"

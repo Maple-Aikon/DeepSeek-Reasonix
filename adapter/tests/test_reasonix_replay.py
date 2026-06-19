@@ -61,28 +61,29 @@ def test_no_dispatcher_returns_error_list():
 
 
 def test_dispatcher_called_with_sid_only_when_since_seq_default():
-    """Default ``since_seq=0`` is forwarded to dispatcher.replay()."""
+    """Default ``since_seq=0`` + default ``mode="conversation"`` are
+    forwarded to dispatcher.replay() (R13.3: mode is keyword-only)."""
     fake = MagicMock()
-    fake.replay = MagicMock(return_value=[{"seq": 0, "kind": "user"}])
+    fake.replay = MagicMock(return_value=[{"role": "user", "turn": 0, "text": "hi"}])
     status_tool.set_dispatcher(fake)
 
     result = status_tool.reasonix_replay("sid-abc")
 
-    # Verify the call shape
-    fake.replay.assert_called_once_with("sid-abc", since_seq=0)
-    assert result == [{"seq": 0, "kind": "user"}]
+    # Verify the call shape (R13.3: mode is keyword-only kwarg)
+    fake.replay.assert_called_once_with("sid-abc", since_seq=0, mode="conversation")
+    assert result == [{"role": "user", "turn": 0, "text": "hi"}]
 
 
 def test_dispatcher_called_with_explicit_since_seq():
-    """Explicit ``since_seq=5`` is forwarded verbatim."""
+    """Explicit ``since_seq=5`` is forwarded verbatim (default mode)."""
     fake = MagicMock()
-    fake.replay = MagicMock(return_value=[{"seq": 5, "kind": "agent_message_chunk"}])
+    fake.replay = MagicMock(return_value=[{"role": "assistant", "turn": 5, "text": "reply"}])
     status_tool.set_dispatcher(fake)
 
     result = status_tool.reasonix_replay("sid-xyz", since_seq=5)
 
-    fake.replay.assert_called_once_with("sid-xyz", since_seq=5)
-    assert result == [{"seq": 5, "kind": "agent_message_chunk"}]
+    fake.replay.assert_called_once_with("sid-xyz", since_seq=5, mode="conversation")
+    assert result == [{"role": "assistant", "turn": 5, "text": "reply"}]
 
 
 def test_dispatcher_exception_surfaces_as_error_list():
@@ -115,4 +116,97 @@ def test_empty_replay_passes_through():
     result = status_tool.reasonix_replay("sid-empty")
 
     assert result == []
-    fake.replay.assert_called_once_with("sid-empty", since_seq=0)
+    fake.replay.assert_called_once_with("sid-empty", since_seq=0, mode="conversation")
+
+
+# === R13.3: 3-mode API tests (6 new tests) ===
+# These pin the new mode=raw|conversation|summary contract added in
+# R13.3. The dispatcher is mocked; we only care that the wrapper
+# passes mode through correctly and shapes errors consistently.
+
+
+def test_mode_raw_forwards_to_dispatcher():
+    """Explicit ``mode="raw"`` is forwarded to dispatcher.replay()."""
+    fake = MagicMock()
+    fake.replay = MagicMock(return_value=[{"kind": "agent_message_chunk", "text": "hi"}])
+    status_tool.set_dispatcher(fake)
+
+    result = status_tool.reasonix_replay("sid-r", mode="raw")
+
+    fake.replay.assert_called_once_with("sid-r", since_seq=0, mode="raw")
+    assert result == [{"kind": "agent_message_chunk", "text": "hi"}]
+
+
+def test_mode_summary_forwards_to_dispatcher():
+    """``mode="summary"`` is forwarded (R13.x returns ``[]``; R14
+    will fill in real summary data)."""
+    fake = MagicMock()
+    fake.replay = MagicMock(return_value=[])
+    status_tool.set_dispatcher(fake)
+
+    result = status_tool.reasonix_replay("sid-s", mode="summary")
+
+    fake.replay.assert_called_once_with("sid-s", since_seq=0, mode="summary")
+    assert result == []
+
+
+def test_invalid_mode_returns_error_list():
+    """If dispatcher raises ``ValueError`` (invalid mode), the
+    wrapper returns ``[error_dict]`` with ``error="invalid_mode"`` —
+    NOT a raised exception. LLM caller reads the error directly.
+    """
+    fake = MagicMock()
+    fake.replay = MagicMock(side_effect=ValueError("mode must be raw|conversation|summary"))
+    status_tool.set_dispatcher(fake)
+
+    result = status_tool.reasonix_replay("sid-bad", mode="garbage")
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    err = result[0]
+    assert err["sid"] == "sid-bad"
+    assert err["error"] == "invalid_mode"
+    assert "mode must be raw" in err["message"]
+
+
+def test_default_mode_is_conversation():
+    """When caller doesn't pass ``mode``, wrapper defaults to
+    ``"conversation"`` (R13.3 contract: most LLM callers want the
+    merged dialog, not the wire dump)."""
+    fake = MagicMock()
+    fake.replay = MagicMock(return_value=[{"role": "user", "turn": 0, "text": "hi"}])
+    status_tool.set_dispatcher(fake)
+
+    status_tool.reasonix_replay("sid-d")
+
+    # The dispatched mode must be "conversation" by default
+    _args, kwargs = fake.replay.call_args
+    assert kwargs["mode"] == "conversation"
+
+
+def test_mode_conversation_explicit():
+    """Explicit ``mode="conversation"`` is identical to default."""
+    fake = MagicMock()
+    fake.replay = MagicMock(return_value=[
+        {"role": "user", "turn": 0, "text": "hi"},
+        {"role": "assistant", "turn": 0, "text": "hello"},
+    ])
+    status_tool.set_dispatcher(fake)
+
+    result = status_tool.reasonix_replay("sid-c", mode="conversation")
+
+    fake.replay.assert_called_once_with("sid-c", since_seq=0, mode="conversation")
+    assert len(result) == 2
+    assert result[0]["role"] == "user"
+    assert result[1]["role"] == "assistant"
+
+
+def test_mode_with_explicit_since_seq():
+    """All three args (sid, since_seq, mode) are forwarded correctly."""
+    fake = MagicMock()
+    fake.replay = MagicMock(return_value=[])
+    status_tool.set_dispatcher(fake)
+
+    status_tool.reasonix_replay("sid-tri", since_seq=10, mode="raw")
+
+    fake.replay.assert_called_once_with("sid-tri", since_seq=10, mode="raw")
