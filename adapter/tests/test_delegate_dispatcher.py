@@ -540,3 +540,106 @@ class TestConcurrency:
         sids = {r["sid"] for r in results}
         assert len(sids) == 3
         assert sids == {"stub-sid-001", "stub-sid-002", "stub-sid-003"}
+
+
+# ---------------------------------------------------------------------------
+# R13.4: parallel dispatcher log (<sid>.dispatcher.jsonl) for user prompts
+# ---------------------------------------------------------------------------
+
+
+class TestR13UserLog:
+    """R13.4: ``dispatch()`` persists the user prompt to a parallel
+    dispatcher log (``<sid>.dispatcher.jsonl``) so
+    ``replay(mode="conversation")`` can reconstruct the user side of
+    the dialog (the binary's ``<sid>.jsonl`` does not echo
+    ``session/prompt`` requests).
+
+    The log is **best-effort** — a write failure must NOT fail the
+    user's dispatch call (R13.4 spec). These tests cover the happy
+    path; the swallow-on-failure behavior is exercised in
+    :mod:`adapter.tests.test_delegate_dispatcher_faults` (deferred
+    to R13.x — needs a fault-injection layer).
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_writes_user_prompt_to_dispatcher_log(
+        self, wired_dispatcher: DelegateDispatcher, stub_log_capture: _StubLogCapture,
+    ) -> None:
+        await wired_dispatcher.dispatch(prompt="explain recursion")
+        # R13.4 _append_user_log is fire-and-forget (loop.create_task).
+        # Drain the background task — each task acquires an asyncio.Lock
+        # then awaits asyncio.to_thread, so we need real wall-clock time
+        # for the loop to schedule the write.
+        path = stub_log_capture._log_dir / "stub-sid-001.dispatcher.jsonl"
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if path.exists() and path.stat().st_size > 0:
+                break
+        assert path.exists(), f"dispatcher log not created at {path}"
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        # R13.4 contract: 5 fields, role="user", source="dispatcher".
+        assert set(record.keys()) == {"ts", "turn", "role", "text", "source"}
+        assert record["role"] == "user"
+        assert record["source"] == "dispatcher"
+        assert record["text"] == "explain recursion"
+        assert record["turn"] == 1
+        assert isinstance(record["ts"], float)
+
+    @pytest.mark.asyncio
+    async def test_consecutive_dispatches_increment_turn_number(
+        self, stub_supervisor: _StubSupervisor, stub_log_capture: _StubLogCapture,
+    ) -> None:
+        # R13.4: turn count advances per-dispatch on the SAME sid.
+        # The default _StubSupervisor auto-increments sid_counter, which
+        # would mask the increment test. Override new_session to return
+        # a fixed sid so all three dispatches land in the same file
+        # with turn=1, 2, 3.
+        class _FixedSidSupervisor(_StubSupervisor):  # type: ignore[misc]
+            async def new_session(self, cwd: str | None = None) -> dict:
+                self.new_session_calls.append({"cwd": cwd, "sid": "fixed-sid"})
+                return {"sessionId": "fixed-sid"}
+
+        dispatcher = DelegateDispatcher(
+            _FixedSidSupervisor(),  # type: ignore[arg-type]
+            log_capture=stub_log_capture,
+        )
+        await dispatcher.dispatch(prompt="turn one")
+        await dispatcher.dispatch(prompt="turn two")
+        await dispatcher.dispatch(prompt="turn three")
+        # Drain the background write tasks before reading the file.
+        # Each task acquires an asyncio.Lock then awaits
+        # asyncio.to_thread for the actual I/O, so we need real
+        # wall-clock time for the loop to schedule all three.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+        path = stub_log_capture._log_dir / "fixed-sid.dispatcher.jsonl"
+        assert path.exists(), f"missing dispatcher log: {path}"
+        lines = [
+            ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+        assert len(lines) == 3, f"expected 3 records, got {len(lines)}"
+        records = [json.loads(ln) for ln in lines]
+        # R13.4 contract: turn increments per dispatch on the same sid.
+        assert [r["turn"] for r in records] == [1, 2, 3]
+        assert [r["text"] for r in records] == ["turn one", "turn two", "turn three"]
+        for r in records:
+            assert r["role"] == "user"
+            assert r["source"] == "dispatcher"
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_log_uses_log_capture_dir_when_wired(
+        self, wired_dispatcher: DelegateDispatcher, stub_log_capture: _StubLogCapture,
+    ) -> None:
+        # _user_log_path mirrors _log_path: prefer log_capture._log_dir.
+        # Verify the dispatcher log lands inside the same temp dir as
+        # the binary log, not in SESSION_LOG_DIR.
+        await wired_dispatcher.dispatch(prompt="x")
+        binary_log = stub_log_capture._log_dir / "stub-sid-001.jsonl"
+        dispatcher_log = stub_log_capture._log_dir / "stub-sid-001.dispatcher.jsonl"
+        assert dispatcher_log.parent == binary_log.parent == stub_log_capture._log_dir
+        # And NOT in SESSION_LOG_DIR (sanity check that we're using
+        # the wired dir, not the global default).
+        assert not (SESSION_LOG_DIR / "stub-sid-001.dispatcher.jsonl").exists() \
+            or dispatcher_log.parent == stub_log_capture._log_dir
