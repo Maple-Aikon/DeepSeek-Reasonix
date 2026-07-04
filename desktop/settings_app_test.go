@@ -97,6 +97,16 @@ func TestProviderViewFromEntry_MigratesProviderWideVision(t *testing.T) {
 	}
 }
 
+func TestProviderViewFromEntryIncludesThinking(t *testing.T) {
+	view := providerViewFromEntry(config.ProviderEntry{
+		Name:     "anthropic",
+		Thinking: "ADAPTIVE",
+	}, false, true)
+	if view.Thinking != "adaptive" {
+		t.Fatalf("ProviderView.Thinking = %q, want adaptive", view.Thinking)
+	}
+}
+
 func TestProviderViewFromEntryShowsKeySource(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	t.Setenv("TEST_PROVIDER_KEY_SOURCE", "")
@@ -117,6 +127,43 @@ func TestProviderViewFromEntryShowsKeySource(t *testing.T) {
 	}
 	if view.KeySource == "" || !strings.Contains(view.KeySource, "credentials") {
 		t.Fatalf("KeySource = %q, want credentials source", view.KeySource)
+	}
+}
+
+func TestSettingsExposesEffectiveSandboxWriteRoots(t *testing.T) {
+	home := isolateDesktopUserDirs(t)
+	project := robustTempDir(t)
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	cfg.Sandbox.AllowWrite = []string{
+		"${HOME}/.m2",
+		"${HOME}/.m2/repository",
+	}
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	app := NewApp()
+	app.tabs = map[string]*WorkspaceTab{
+		"project": {ID: "project", Scope: "project", WorkspaceRoot: project, Ready: true},
+	}
+	app.activeTabID = "project"
+
+	got := app.Settings().Sandbox
+	if got.EffectiveWorkspaceRoot != project {
+		t.Fatalf("EffectiveWorkspaceRoot = %q, want %q", got.EffectiveWorkspaceRoot, project)
+	}
+	// Settings expose expanded configured roots; the writer confiner normalizes
+	// separators later when enforcing them.
+	want := []string{
+		project,
+		home + "/.m2",
+		home + "/.m2/repository",
+	}
+	if !reflect.DeepEqual(got.EffectiveWriteRoots, want) {
+		t.Fatalf("EffectiveWriteRoots = %v, want %v", got.EffectiveWriteRoots, want)
+	}
+	if !reflect.DeepEqual(got.AllowWrite, cfg.Sandbox.AllowWrite) {
+		t.Fatalf("AllowWrite = %v, want raw configured paths %v", got.AllowWrite, cfg.Sandbox.AllowWrite)
 	}
 }
 
@@ -382,6 +429,60 @@ func TestSaveProviderFiltersNonChatModels(t *testing.T) {
 	}
 }
 
+func TestSaveProviderPersistsThinkingOverride(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	if err := app.SaveProvider(ProviderView{
+		Name:      "glm-proxy",
+		Kind:      "openai",
+		BaseURL:   "https://proxy.example.com/v1",
+		Models:    []string{"glm-4.5-air"},
+		APIKeyEnv: "GLM_PROXY_API_KEY",
+		Thinking:  "DISABLED",
+	}); err != nil {
+		t.Fatalf("SaveProvider: %v", err)
+	}
+
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	got, ok := cfg.Provider("glm-proxy")
+	if !ok {
+		t.Fatal("saved provider not found")
+	}
+	if got.Thinking != "disabled" {
+		t.Fatalf("saved provider thinking = %q, want disabled", got.Thinking)
+	}
+}
+
+func TestSaveProviderPersistsAuthHeader(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	if err := app.SaveProvider(ProviderView{
+		Name:       "minimax-global-anthropic",
+		Kind:       "anthropic",
+		BaseURL:    "https://api.minimax.io/anthropic",
+		Models:     []string{"MiniMax-M3"},
+		APIKeyEnv:  "MINIMAX_API_KEY",
+		AuthHeader: true,
+	}); err != nil {
+		t.Fatalf("SaveProvider: %v", err)
+	}
+
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	got, ok := cfg.Provider("minimax-global-anthropic")
+	if !ok {
+		t.Fatal("saved provider not found")
+	}
+	if !got.AuthHeader {
+		t.Fatal("saved provider auth_header = false, want true")
+	}
+	view := providerViewFromEntry(*got, false, true)
+	if !view.AuthHeader {
+		t.Fatal("provider view authHeader = false, want true")
+	}
+}
+
 func TestSaveProviderPersistsCustomEndpointURLs(t *testing.T) {
 	isolateDesktopUserDirs(t)
 
@@ -443,6 +544,7 @@ func TestSaveProviderPreservesHiddenProviderFields(t *testing.T) {
 		Thinking:     "adaptive",
 		Effort:       "high",
 		VisionDetail: "low",
+		ExtraBody:    map[string]any{"enable_thinking": true},
 		NoProxy:      true,
 	}}
 	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
@@ -462,6 +564,9 @@ func TestSaveProviderPreservesHiddenProviderFields(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("Settings providers missing custom: %+v", settings.Providers)
+	}
+	if view.ExtraBody["enable_thinking"] != true {
+		t.Fatalf("settings extra_body = %+v, want enable_thinking=true", view.ExtraBody)
 	}
 
 	if err := app.SaveProvider(view); err != nil {
@@ -484,6 +589,9 @@ func TestSaveProviderPreservesHiddenProviderFields(t *testing.T) {
 	}
 	if got.VisionDetail != "low" {
 		t.Fatalf("vision_detail = %q, want low", got.VisionDetail)
+	}
+	if got.ExtraBody["enable_thinking"] != true {
+		t.Fatalf("extra_body = %+v, want enable_thinking=true", got.ExtraBody)
 	}
 	if !got.NoProxy {
 		t.Fatal("no_proxy = false, want preserved true")
@@ -721,7 +829,7 @@ func TestSetReasoningLanguageUpdatesLiveTabControllers(t *testing.T) {
 	}
 
 	userComposed := userCtrl.Compose("hi")
-	if !strings.Contains(userComposed, "Simplified Chinese") {
+	if !strings.Contains(userComposed, "简体中文") {
 		t.Fatalf("user-level tab Compose = %q, want zh reasoning language", userComposed)
 	}
 	projectComposed := projectCtrl.Compose("hi")

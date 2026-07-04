@@ -43,7 +43,9 @@ import (
 	"reasonix/internal/i18n"
 	"reasonix/internal/mcpdiag"
 	"reasonix/internal/memory"
+	"reasonix/internal/notify"
 	"reasonix/internal/plugin"
+	"reasonix/internal/pluginpkg"
 	"reasonix/internal/provider"
 	"reasonix/internal/skill"
 )
@@ -140,6 +142,9 @@ type App struct {
 	botRuntime  *desktopBotRuntime
 
 	metrics atomic.Pointer[metricsAggregator] // non-nil only when desktop.metrics is opted in; swapped live by SetDesktopMetrics
+
+	notificationSenderOnce sync.Once
+	notificationSender     notify.Sender
 
 	runtimeEvents asyncRuntimeEmitter
 
@@ -663,6 +668,7 @@ func (a *App) shutdown(context.Context) {
 				slog.Warn("desktop: shutdown snapshot failed", "tab", t.ID, "err", err)
 			}
 			t.Ctrl.Close()
+			t.releaseSessionLease()
 		}
 	}
 }
@@ -1430,6 +1436,9 @@ func (a *App) ClearSession() error {
 	if err := ctrl.ClearSession(); err != nil {
 		return err
 	}
+	if err := tab.ensureSessionLease(ctrl.SessionPath()); err != nil {
+		return err
+	}
 	tab.resetTelemetry()
 	a.persistTabSessionPath(tab, ctrl.SessionPath())
 	a.invalidatePromptHistoryCache()
@@ -1474,6 +1483,8 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 		TokenMode:                currentTabTokenMode(tab),
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
+		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
 	})
 	if err != nil {
 		if teardownTimedOut {
@@ -1505,6 +1516,10 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
 	newCtrl.SetGoal(tab.goal)
 	path := agent.NewSessionPath(newCtrl.SessionDir(), newCtrl.Label())
+	if err := tab.ensureSessionLease(path); err != nil {
+		newCtrl.Close()
+		return err
+	}
 	newCtrl.SetSessionPath(path)
 
 	a.mu.Lock()
@@ -1901,7 +1916,11 @@ func (a *App) ListSessions() []SessionMeta {
 	out := make([]SessionMeta, 0, len(infos))
 	for _, s := range infos {
 		_, isOpen := open[s.Path]
-		meta := sessionMetaFromInfo(s, titles[filepath.Base(s.Path)], s.Path == active, isOpen, 0)
+		title := strings.TrimSpace(s.CustomTitle)
+		if title == "" {
+			title = titles[filepath.Base(s.Path)]
+		}
+		meta := sessionMetaFromInfo(s, title, s.Path == active, isOpen, 0)
 		if route, ok := channelRoutes[sessionRuntimeKey(s.Path)]; ok {
 			applyChannelSessionRoute(&meta, route)
 		}
@@ -1926,7 +1945,11 @@ func (a *App) ListTrashedSessions() []SessionMeta {
 				continue
 			}
 			deletedAt := trashedSessionDeletedAt(path)
-			out = append(out, sessionMetaFromInfo(infos[0], titles[filepath.Base(path)], false, false, deletedAt))
+			title := strings.TrimSpace(infos[0].CustomTitle)
+			if title == "" {
+				title = titles[filepath.Base(path)]
+			}
+			out = append(out, sessionMetaFromInfo(infos[0], title, false, false, deletedAt))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -2293,7 +2316,11 @@ func (a *App) prepareRemovedSessionRuntimes(removed []removedSessionRuntime) err
 			continue
 		}
 		if err := item.ctrl.Snapshot(); err != nil {
-			return err
+			if !errors.Is(err, agent.ErrSessionSnapshotConflict) {
+				return err
+			}
+			slog.Warn("desktop: skipping stale runtime snapshot before removing session",
+				"session", item.sessionPath, "err", err)
 		}
 		item.ctrl.SetSessionPath("")
 		a.quiesceTabAutosave(item.tab)
@@ -2402,6 +2429,7 @@ func (a *App) closeRemovedSessionRuntime(item removedSessionRuntime, closed map[
 				releasedTabs[item.tab] = true
 			}
 			a.releaseTabSharedHost(item.tab)
+			item.tab.releaseSessionLease()
 		}
 	}
 	if item.ctrl == nil {
@@ -2607,9 +2635,19 @@ func (a *App) PurgeTrashedSession(path string) error {
 }
 
 // RenameSession sets a custom display name for a session (empty clears it back to
-// the preview). It only affects the history panel; the file on disk is unchanged.
+// the preview). The transcript file is unchanged; the canonical name lives in
+// the branch meta sidecar, with the legacy .titles.json map kept as a
+// compatibility write-through for older desktop data paths.
 func (a *App) RenameSession(path, title string) error {
-	if err := setSessionTitle(a.activeSessionDir(), path, title); err != nil {
+	dir := a.activeSessionDir()
+	sessionPath, _, err := validateSessionPath(dir, path)
+	if err != nil {
+		return err
+	}
+	if err := agent.RenameSession(sessionPath, title); err != nil {
+		return err
+	}
+	if err := setSessionTitle(dir, sessionPath, title); err != nil {
 		return err
 	}
 	a.invalidatePromptHistoryCache()
@@ -2806,6 +2844,7 @@ func (a *App) rebindTabToLoadedSessionPath(tab *WorkspaceTab, sessionPath string
 		}
 	} else {
 		ctrl.Close()
+		tab.releaseSessionLease()
 	}
 
 	a.mu.Lock()
@@ -4996,6 +5035,7 @@ func (a *App) Commands() []CommandInfo {
 		{Name: "remember", Description: i18n.M.CmdRemember, Kind: "builtin"},
 		{Name: "mcp", Description: i18n.M.CmdMcp, Kind: "builtin"},
 		{Name: "hooks", Description: i18n.M.CmdHooks, Kind: "builtin"},
+		{Name: "plugins", Description: i18n.M.CmdPlugins, Kind: "builtin"},
 		{Name: "theme", Description: i18n.M.CmdTheme, Kind: "builtin"},
 		{Name: "skill", Description: i18n.M.CmdSkill, Kind: "builtin"},
 		{Name: "reload-cmd", Description: i18n.M.CmdReloadCmd, Kind: "builtin"},
@@ -5062,6 +5102,9 @@ func (a *App) SlashArgs(input string) SlashArgsResult {
 		DisconnectedMCP: ctrl.DisconnectedMCPNames(),
 		CurrentModel:    model,
 	}
+	if names, err := pluginpkg.InstalledNames(config.ReasonixHomeDir()); err == nil {
+		data.PluginNames = names
+	}
 	seen := map[string]bool{}
 	for _, m := range a.Models() {
 		data.ModelRefs = append(data.ModelRefs, m.Ref)
@@ -5092,6 +5135,7 @@ type CapabilitiesView struct {
 	Servers    []ServerView    `json:"servers"`
 	Skills     []SkillView     `json:"skills"`
 	SkillRoots []SkillRootView `json:"skillRoots"`
+	Plugins    []PluginView    `json:"plugins"`
 }
 
 // SkillsSettingsView is the skills management page's data, split from MCP
@@ -5174,6 +5218,7 @@ func (a *App) Capabilities() CapabilitiesView {
 		Servers:    a.MCPServers(),
 		Skills:     skills.Skills,
 		SkillRoots: skills.SkillRoots,
+		Plugins:    a.Plugins(),
 	}
 }
 
@@ -5603,6 +5648,27 @@ func (a *App) PickSkillFolder() (string, error) {
 		return "", err
 	}
 	return normalizeSkillPath(dir), nil
+}
+
+// PickPluginFolder opens a directory picker for choosing a local plugin package
+// source. It returns the selected directory path; plugin install/plan performs
+// manifest validation and decides whether to copy or link the package.
+func (a *App) PickPluginFolder() (string, error) {
+	if a.ctx == nil {
+		return "", nil
+	}
+	cur := a.activeWorkspaceRoot()
+	if strings.TrimSpace(cur) == "" {
+		cur, _ = os.Getwd()
+	}
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:            "Choose plugin folder",
+		DefaultDirectory: dialogDefaultDirectory(cur),
+	})
+	if err != nil || dir == "" {
+		return "", err
+	}
+	return filepath.Clean(dir), nil
 }
 
 // AddSkillPath adds a custom skill root to the user config and rebuilds the
@@ -6563,11 +6629,27 @@ func (a *App) SetModelForTab(tabID, name string) error {
 		TokenMode:                currentTabTokenMode(tab),
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
+		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
 	})
 	if err != nil {
+		tab.releaseSessionLease()
 		return err
 	}
 	a.bindControllerDisplayRecorder(newCtrl)
+	newCtrl.EnableInteractiveApproval()
+	applyTabModeToController(newCtrl, tab.mode)
+	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
+	newCtrl.SetGoal(tab.goal)
+
+	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
+	if err := tab.ensureSessionLease(path); err != nil {
+		newCtrl.Close()
+		tab.releaseSessionLease()
+		return err
+	}
+	resumeWithFreshSystemPrompt(newCtrl, carried, path)
+	a.persistTabSessionPath(tab, path)
 	a.mu.Lock()
 	tab.Ctrl = newCtrl
 	tab.model = name
@@ -6575,14 +6657,6 @@ func (a *App) SetModelForTab(tabID, name string) error {
 	tab.Label = newCtrl.Label()
 	a.saveTabsLocked()
 	a.mu.Unlock()
-	newCtrl.EnableInteractiveApproval()
-	applyTabModeToController(newCtrl, tab.mode)
-	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
-	newCtrl.SetGoal(tab.goal)
-
-	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
-	resumeWithFreshSystemPrompt(newCtrl, carried, path)
-	a.persistTabSessionPath(tab, path)
 	return nil
 }
 
@@ -6665,11 +6739,26 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 		TokenMode:                currentTabTokenMode(tab),
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
+		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
 	})
 	if err != nil {
+		tab.releaseSessionLease()
 		return err
 	}
 	a.bindControllerDisplayRecorder(newCtrl)
+	newCtrl.EnableInteractiveApproval()
+	applyTabModeToController(newCtrl, tab.mode)
+	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
+	newCtrl.SetGoal(tab.goal)
+	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
+	if err := tab.ensureSessionLease(path); err != nil {
+		newCtrl.Close()
+		tab.releaseSessionLease()
+		return err
+	}
+	resumeWithFreshSystemPrompt(newCtrl, carried, path)
+	a.persistTabSessionPath(tab, path)
 	a.mu.Lock()
 	tab.Ctrl = newCtrl
 	tab.model = modelRef
@@ -6679,13 +6768,6 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 	tab.Ready = true
 	a.saveTabsLocked()
 	a.mu.Unlock()
-	newCtrl.EnableInteractiveApproval()
-	applyTabModeToController(newCtrl, tab.mode)
-	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
-	newCtrl.SetGoal(tab.goal)
-	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
-	resumeWithFreshSystemPrompt(newCtrl, carried, path)
-	a.persistTabSessionPath(tab, path)
 	return nil
 }
 
@@ -6743,14 +6825,27 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 		TokenMode:                mode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
+		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
 	})
 	if err != nil {
 		return err
 	}
 	a.bindControllerDisplayRecorder(newCtrl)
+	newCtrl.EnableInteractiveApproval()
+	applyTabModeToController(newCtrl, tab.mode)
+	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
+	newCtrl.SetGoal(tab.goal)
+	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
+	if err := tab.ensureSessionLease(path); err != nil {
+		newCtrl.Close()
+		return err
+	}
+	resumeWithFreshSystemPrompt(newCtrl, carried, path)
 	if oldCtrl != nil {
 		oldCtrl.Close()
 	}
+	a.persistTabSessionPath(tab, path)
 	a.mu.Lock()
 	tab.Ctrl = newCtrl
 	tab.model = modelRef
@@ -6760,13 +6855,6 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 	tab.Ready = true
 	a.saveTabsLocked()
 	a.mu.Unlock()
-	newCtrl.EnableInteractiveApproval()
-	applyTabModeToController(newCtrl, tab.mode)
-	applyTabToolApprovalModeToController(newCtrl, tab.toolApprovalMode)
-	newCtrl.SetGoal(tab.goal)
-	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
-	resumeWithFreshSystemPrompt(newCtrl, carried, path)
-	a.persistTabSessionPath(tab, path)
 	return nil
 }
 

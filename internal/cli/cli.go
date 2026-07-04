@@ -106,6 +106,9 @@ func Run(args []string, version string) int {
 	case "mcp":
 		configureCLIThemeFromConfigNoProbe()
 		return mcpCommand(rest)
+	case "plugin":
+		configureCLIThemeFromConfigNoProbe()
+		return pluginCommand(rest)
 	case "doctor":
 		configureCLIThemeFromConfigNoProbe()
 		return doctorCommand(rest, version)
@@ -144,7 +147,7 @@ func isDefaultInteractiveFlag(arg string) bool {
 
 func shouldMigrateLegacyConfigForCLI(cmd string) bool {
 	switch cmd {
-	case "", "run", "chat", "code", "serve", "setup", "config", "init", "acp", "mcp", "doctor", "bot", "upgrade", "update":
+	case "", "run", "chat", "code", "serve", "setup", "config", "init", "acp", "mcp", "plugin", "doctor", "bot", "upgrade", "update":
 		return true
 	default:
 		return false
@@ -505,6 +508,9 @@ func runServe(args []string) int {
 		fmt.Printf("  share: http://%s/?token=%s\n", *addr, srv.AuthToken())
 	} else if srv.AuthMode() == "password" {
 		fmt.Printf("  auth: password (login at http://%s/login)\n", *addr)
+	}
+	if warning := serve.PlainHTTPAuthWarning(serveCfg, *addr); warning != "" {
+		fmt.Fprintf(os.Stderr, "  %s\n", warning)
 	}
 	// Diagnostic: check whether balance endpoint is reachable
 	if b, err := ctrl.Balance(context.Background()); err != nil {

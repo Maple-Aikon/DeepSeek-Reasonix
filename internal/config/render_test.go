@@ -156,6 +156,7 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Agent.ToolResultSnipRatio = 0.65
 	orig.Agent.SubagentModel = "mimo-pro"
 	orig.Agent.SubagentModels = map[string]string{"review": "deepseek-pro"}
+	orig.Agent.MaxSubagentDepth = 3
 	orig.Agent.Keep = []string{"errors", "user_marked"}
 	orig.Agent.RecentKeep = 4
 	orig.Tools.BashTimeoutSeconds = intPtr(900)
@@ -185,6 +186,15 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Skills.DisabledSkills = []string{"review", "explore"}
 	orig.Skills.MaxDepth = 2
 	orig.Bot.ToolApprovalMode = "auto"
+	orig.Bot.Control = BotControlConfig{Enabled: true, Addr: "127.0.0.1:39001", TokenEnv: "BOT_CONTROL_TOKEN"}
+	orig.Bot.Routes = []BotRouteConfig{{
+		ConnectionID:     "feishu-lark",
+		ChatType:         "group",
+		ChatID:           "oc_group",
+		Model:            "deepseek-pro",
+		ToolApprovalMode: "ask",
+		WorkspaceRoot:    "/tmp/reasonix-route",
+	}}
 	orig.Bot.Connections = []BotConnectionConfig{{
 		ID:               "feishu-lark",
 		Provider:         "feishu",
@@ -226,6 +236,8 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	mm.ChatURL = "http://localhost:8000/v1/chat/completions"
 	mm.ModelsURL = "http://localhost:8000/v1/models"
 	mm.ReasoningProtocol = "openai"
+	mm.PresetID = "mimo-api"
+	mm.PresetVersion = ProviderPresetVersion
 	ds, _ := orig.Provider("deepseek-flash")
 	ds.Effort = "max"
 
@@ -302,6 +314,12 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.Bot.ToolApprovalMode != "auto" || got.Bot.Connections[0].ToolApprovalMode != "yolo" {
 		t.Errorf("bot tool approval mode not preserved: bot=%q connection=%q", got.Bot.ToolApprovalMode, got.Bot.Connections[0].ToolApprovalMode)
 	}
+	if !got.Bot.Control.Enabled || got.Bot.Control.Addr != "127.0.0.1:39001" || got.Bot.Control.TokenEnv != "BOT_CONTROL_TOKEN" {
+		t.Errorf("bot control not preserved: %+v", got.Bot.Control)
+	}
+	if len(got.Bot.Routes) != 1 || got.Bot.Routes[0].WorkspaceRoot != "/tmp/reasonix-route" || got.Bot.Routes[0].ChatID != "oc_group" {
+		t.Errorf("bot routes not preserved: %+v", got.Bot.Routes)
+	}
 	if len(got.Bot.Connections[0].SessionMappings) != 1 || got.Bot.Connections[0].SessionMappings[0].Scope != "project" || got.Bot.Connections[0].SessionMappings[0].WorkspaceRoot != "/tmp/reasonix-bot" {
 		t.Errorf("bot session mapping scope not preserved: %+v", got.Bot.Connections[0].SessionMappings)
 	}
@@ -366,6 +384,9 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.Agent.SubagentModels["review"] != "deepseek-pro" {
 		t.Errorf("subagent_models.review = %q, want deepseek-pro", got.Agent.SubagentModels["review"])
 	}
+	if got.Agent.MaxSubagentDepth != 3 {
+		t.Errorf("max_subagent_depth = %d, want 3", got.Agent.MaxSubagentDepth)
+	}
 	if got.Tools.BashTimeoutSeconds == nil || *got.Tools.BashTimeoutSeconds != 900 {
 		t.Errorf("tools.bash_timeout_seconds = %v, want 900", got.Tools.BashTimeoutSeconds)
 	}
@@ -380,6 +401,9 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	if g, _ := got.Provider("mimo-pro"); g == nil || g.BaseURL != "http://localhost:8000/v1" || g.ChatURL != "http://localhost:8000/v1/chat/completions" || g.ModelsURL != "http://localhost:8000/v1/models" || g.ReasoningProtocol != "openai" {
 		t.Errorf("mimo-pro endpoint fields not preserved: %+v", g)
+	}
+	if g, _ := got.Provider("mimo-pro"); g == nil || g.PresetID != "mimo-api" || g.PresetVersion != ProviderPresetVersion {
+		t.Errorf("mimo-pro preset metadata not preserved: %+v", g)
 	}
 	if g, _ := got.Provider("deepseek-flash"); g == nil || g.Effort != "max" {
 		t.Errorf("deepseek-flash effort not preserved: %+v", g)
@@ -438,6 +462,7 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 func TestRenderTOMLDocumentsPlanModeAllowedTools(t *testing.T) {
 	cfg := Default()
 	cfg.Agent.PlanModeAllowedTools = []string{"custom_reader"}
+	cfg.Agent.PlanModeReadOnlyCommands = []string{"gh issue view"}
 
 	rendered := RenderTOML(cfg)
 	if !strings.Contains(rendered, `plan_mode_allowed_tools = ["custom_reader"]`) {
@@ -453,6 +478,15 @@ func TestRenderTOMLDocumentsPlanModeAllowedTools(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Agent.PlanModeAllowedTools, cfg.Agent.PlanModeAllowedTools) {
 		t.Fatalf("PlanModeAllowedTools round trip = %v, want %v", got.Agent.PlanModeAllowedTools, cfg.Agent.PlanModeAllowedTools)
+	}
+	if !strings.Contains(rendered, `plan_mode_read_only_commands = ["gh issue view"]`) {
+		t.Fatalf("rendered config should preserve plan_mode_read_only_commands:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "concrete read-only shell prefixes") {
+		t.Fatalf("rendered config should document plan_mode_read_only_commands semantics:\n%s", rendered)
+	}
+	if !reflect.DeepEqual(got.Agent.PlanModeReadOnlyCommands, cfg.Agent.PlanModeReadOnlyCommands) {
+		t.Fatalf("PlanModeReadOnlyCommands round trip = %v, want %v", got.Agent.PlanModeReadOnlyCommands, cfg.Agent.PlanModeReadOnlyCommands)
 	}
 }
 
@@ -841,6 +875,14 @@ func TestRenderTOMLRoundTripsProviderHeadersAndModelOverrides(t *testing.T) {
 			"HTTP-Referer": "https://app.example",
 			"X-Title":      "Reasonix",
 		},
+		ExtraBody: map[string]any{
+			"enable_thinking": true,
+			"top_p":           0.8,
+			"metadata": map[string]any{
+				"mode": "fast",
+			},
+		},
+		AuthHeader: true,
 		ModelOverrides: map[string]ProviderModelOverride{
 			"deepseek-v4-flash": {
 				ReasoningProtocol: ReasoningProtocolDeepSeek,
@@ -854,6 +896,12 @@ func TestRenderTOMLRoundTripsProviderHeadersAndModelOverrides(t *testing.T) {
 	rendered := RenderTOML(orig)
 	if !strings.Contains(rendered, `headers     = { HTTP-Referer = "https://app.example", X-Title = "Reasonix" }`) {
 		t.Fatalf("rendered TOML missing headers:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `extra_body`) || !strings.Contains(rendered, `"enable_thinking" = true`) {
+		t.Fatalf("rendered TOML missing extra_body:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `auth_header = true`) {
+		t.Fatalf("rendered TOML missing auth_header:\n%s", rendered)
 	}
 	if !strings.Contains(rendered, `model_overrides`) || !strings.Contains(rendered, `reasoning_protocol = "deepseek"`) {
 		t.Fatalf("rendered TOML missing model overrides:\n%s", rendered)
@@ -870,9 +918,46 @@ func TestRenderTOMLRoundTripsProviderHeadersAndModelOverrides(t *testing.T) {
 	if p.Headers["HTTP-Referer"] != "https://app.example" || p.Headers["X-Title"] != "Reasonix" {
 		t.Fatalf("headers after round trip = %+v", p.Headers)
 	}
+	if p.ExtraBody["enable_thinking"] != true || p.ExtraBody["top_p"] != 0.8 {
+		t.Fatalf("extra_body after round trip = %+v", p.ExtraBody)
+	}
+	if !p.AuthHeader {
+		t.Fatal("auth_header after round trip = false, want true")
+	}
+	metadata, ok := p.ExtraBody["metadata"].(map[string]any)
+	if !ok || metadata["mode"] != "fast" {
+		t.Fatalf("extra_body metadata after round trip = %+v", p.ExtraBody["metadata"])
+	}
 	ov := p.ModelOverrides["deepseek-v4-flash"]
 	if ov.ReasoningProtocol != ReasoningProtocolDeepSeek || !reflect.DeepEqual(ov.SupportedEfforts, []string{"high", "max"}) || ov.DefaultEffort != "high" || ov.Vision == nil || *ov.Vision {
 		t.Fatalf("model override after round trip = %+v", ov)
+	}
+}
+
+func TestRenderStringMapQuotesNonBareTOMLKeys(t *testing.T) {
+	rendered := renderStringMap(map[string]string{
+		"github:gh-fix-ci": "deepseek-pro",
+		"review":           "deepseek-flash",
+	})
+	if !strings.Contains(rendered, `"github:gh-fix-ci" = "deepseek-pro"`) {
+		t.Fatalf("non-bare key was not quoted: %s", rendered)
+	}
+	var got struct {
+		M map[string]string `toml:"m"`
+	}
+	if _, err := toml.Decode("m = "+rendered, &got); err != nil {
+		t.Fatalf("rendered inline map does not parse: %v (%s)", err, rendered)
+	}
+	if got.M["github:gh-fix-ci"] != "deepseek-pro" || got.M["review"] != "deepseek-flash" {
+		t.Fatalf("decoded map = %+v", got.M)
+	}
+}
+
+func TestRenderTOMLTablePathQuotesEachSegment(t *testing.T) {
+	got := renderTOMLTablePath("lsp", "servers", "c++", "github:gh-fix-ci")
+	want := `lsp.servers."c++"."github:gh-fix-ci"`
+	if got != want {
+		t.Fatalf("renderTOMLTablePath = %q, want %q", got, want)
 	}
 }
 

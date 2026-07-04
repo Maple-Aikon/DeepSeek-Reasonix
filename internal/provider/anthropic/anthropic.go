@@ -74,6 +74,8 @@ func New(cfg provider.Config) (provider.Provider, error) {
 	thinking, _ := cfg.Extra["thinking"].(string)
 	effort, _ := cfg.Extra["effort"].(string)
 	vision, _ := cfg.Extra["vision"].(bool)
+	headers, _ := cfg.Extra["headers"].(map[string]string)
+	authHeader, _ := cfg.Extra["auth_header"].(bool)
 	httpClient, err := newHTTPClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: network: %w", err)
@@ -103,6 +105,8 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		thinking:    thinking,
 		effort:      effort,
 		vision:      vision,
+		headers:     cleanCustomHeaders(headers),
+		authHeader:  authHeader,
 		http:        httpClient, // no overall timeout; lifecycle is ctx-driven
 		idleTimeout: defaultStreamIdleTimeout,
 	}, nil
@@ -123,6 +127,8 @@ type client struct {
 	thinking    string // "adaptive" enables extended thinking; "" = off (config-driven)
 	effort      string // output_config.effort: low|medium|high|xhigh|max; "" = provider default
 	vision      bool   // model accepts image input — embed attached images as base64 image blocks
+	headers     map[string]string
+	authHeader  bool // send Authorization: Bearer instead of Anthropic's x-api-key header
 	http        *http.Client
 	idleTimeout time.Duration // SSE stall watchdog window; defaultStreamIdleTimeout unless a test overrides
 	authed      atomic.Bool   // a request has succeeded — gate transient-401 retry
@@ -137,6 +143,39 @@ func (c *client) sendOpts() provider.SendOptions {
 		KeySource:  c.keySource,
 		KeyPresent: c.apiKey != "",
 		RetryAuth:  c.authed.Load(),
+	}
+}
+
+func cleanCustomHeaders(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for name, value := range in {
+		name = strings.TrimSpace(name)
+		if name == "" || reservedCustomHeader(name) {
+			continue
+		}
+		out[name] = strings.TrimSpace(value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func reservedCustomHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "content-type", "accept", "x-api-key", "authorization", "anthropic-version":
+		return true
+	default:
+		return false
+	}
+}
+
+func applyCustomHeaders(h http.Header, headers map[string]string) {
+	for name, value := range cleanCustomHeaders(headers) {
+		h.Set(name, value)
 	}
 }
 
@@ -164,8 +203,13 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Accept", "text/event-stream")
-		httpReq.Header.Set("x-api-key", c.apiKey)
+		if c.authHeader {
+			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		} else {
+			httpReq.Header.Set("x-api-key", c.apiKey)
+		}
 		httpReq.Header.Set("anthropic-version", anthropicVersion)
+		applyCustomHeaders(httpReq.Header, c.headers)
 		return httpReq, nil
 	}
 	resp, err := provider.SendWithRetry(ctx, c.http, c.sendOpts(), newReq)
