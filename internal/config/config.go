@@ -1,12 +1,12 @@
 // Package config loads Reasonix's runtime configuration from TOML. Resolution order:
 // flag > project ./reasonix.toml > user config.toml (in the OS user-config dir) > built-in defaults.
+// User-global runtime controls, such as agent step limits, are documented exceptions.
 // Secrets come from the environment via api_key_env and are never stored in
 // config files.
 package config
 
 import (
 	"fmt"
-	"log/slog"
 	"net/netip"
 	"net/url"
 	"os"
@@ -15,8 +15,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/BurntSushi/toml"
-
+	"reasonix/internal/fileutil"
 	"reasonix/internal/netclient"
 	"reasonix/internal/provider"
 )
@@ -53,14 +52,17 @@ type Config struct {
 	Permissions      PermissionsConfig   `toml:"permissions"`
 	Sandbox          SandboxConfig       `toml:"sandbox"`
 	Network          NetworkConfig       `toml:"network"`
+	Environment      EnvironmentConfig   `toml:"environment"`
 	Plugins          []PluginEntry       `toml:"plugins"`
 	Skills           SkillsConfig        `toml:"skills"`
 	Statusline       StatuslineConfig    `toml:"statusline"`
 	LSP              LSPConfig           `toml:"lsp"`
 	Bot              BotConfig           `toml:"bot"`
+	Serve            ServeConfig         `toml:"serve"`
 
 	providerSources          map[string]providerSourceScope
 	shadowedProjectProviders []ProviderEntry
+	expansionEnv             map[string]string
 }
 
 type providerSourceScope string
@@ -78,25 +80,27 @@ type UIConfig struct {
 	ShortcutLayout string `toml:"shortcut_layout"` // classic|desktop; accepted for compatibility
 	CloseBehavior  string `toml:"close_behavior"`  // legacy desktop close behavior; prefer desktop.close_behavior
 	ShowReasoning  bool   `toml:"show_reasoning"`  // Ctrl+O / /verbose: show thinking text in CLI; false = collapsed
+	CursorShape    string `toml:"cursor_shape"`    // block|underline|bar; empty defaults to underline
 }
 
 // DesktopConfig controls desktop-only UI preferences. It is intentionally
 // separate from top-level language and [ui] so desktop choices do not affect CLI
 // language, terminal colours, or provider-visible prompt/request data.
 type DesktopConfig struct {
-	Language       string   `toml:"language"`         // auto|en|zh; empty/auto = browser/OS auto-detect
-	LayoutStyle    string   `toml:"layout_style"`     // classic|workbench; desktop layout style
-	Theme          string   `toml:"theme"`            // auto|dark|light; empty resolves to auto
-	ThemeStyle     string   `toml:"theme_style"`      // graphite|aurora|slate|carbon|nocturne|amber and legacy aliases
-	CloseBehavior  string   `toml:"close_behavior"`   // quit|background; desktop window close behavior
-	DisplayMode    string   `toml:"display_mode"`     // standard|compact (legacy "minimal" maps to compact); transcript display mode
-	StatusBarStyle string   `toml:"status_bar_style"` // icon|text; desktop status bar metric labels
-	StatusBarItems []string `toml:"status_bar_items"` // ordered visible desktop status bar items
-	CheckUpdates   *bool    `toml:"check_updates"`    // startup update checks; nil keeps the default enabled
-	Telemetry      *bool    `toml:"telemetry"`        // anonymous launch ping (install id + version + OS); nil keeps the default enabled
-	Metrics        *bool    `toml:"metrics"`          // aggregate desktop metrics (anonymous signal/bucket counts; no content); nil keeps the default enabled
-	ProviderAccess []string `toml:"provider_access"`  // desktop-only list of provider entries shown in Settings > Model > Access
-	ExpandThinking bool     `toml:"expand_thinking"`  // true = show reasoning text expanded by default; false = collapsed
+	Language                string   `toml:"language"`                   // auto|en|zh; empty/auto = browser/OS auto-detect
+	LayoutStyle             string   `toml:"layout_style"`               // classic|workbench|creation; desktop layout style
+	Theme                   string   `toml:"theme"`                      // auto|dark|light; empty resolves to auto
+	ThemeStyle              string   `toml:"theme_style"`                // graphite|aurora|slate|carbon|nocturne|amber and legacy aliases
+	CloseBehavior           string   `toml:"close_behavior"`             // quit|background; desktop window close behavior
+	DisplayMode             string   `toml:"display_mode"`               // standard|compact (legacy "minimal" maps to compact); transcript display mode
+	StatusBarStyle          string   `toml:"status_bar_style"`           // icon|text; desktop status bar metric labels
+	StatusBarItems          []string `toml:"status_bar_items"`           // ordered visible desktop status bar items
+	DefaultToolApprovalMode string   `toml:"default_tool_approval_mode"` // ask|auto|yolo; default for newly-created desktop sessions
+	CheckUpdates            *bool    `toml:"check_updates"`              // startup update checks; nil keeps the default enabled
+	Telemetry               *bool    `toml:"telemetry"`                  // anonymous launch ping (install id + version + OS); nil keeps the default enabled
+	Metrics                 *bool    `toml:"metrics"`                    // aggregate desktop metrics (anonymous signal/bucket counts; no content); nil keeps the default enabled
+	ProviderAccess          []string `toml:"provider_access"`            // desktop-only list of provider entries shown in Settings > Model > Access
+	ExpandThinking          bool     `toml:"expand_thinking"`            // true = show reasoning text expanded by default; false = collapsed
 }
 
 // NotificationsConfig controls optional system notifications for CLI chat/run.
@@ -105,6 +109,20 @@ type NotificationsConfig struct {
 	TurnDone        bool `toml:"turn_done"`
 	ApprovalRequest bool `toml:"approval_request"`
 	AskRequest      bool `toml:"ask_request"`
+}
+
+// EnvironmentConfig controls the stable startup environment block injected into
+// the model-facing prompt. Enabled nil means the default (enabled); Tools maps a
+// tool name to an explicit executable path when PATH probing is not enough.
+type EnvironmentConfig struct {
+	Enabled *bool             `toml:"enabled"`
+	Tools   map[string]string `toml:"tools"`
+}
+
+// EnvironmentEnabled reports whether startup environment probing should feed the
+// cache-stable system prompt.
+func (c *Config) EnvironmentEnabled() bool {
+	return c == nil || c.Environment.Enabled == nil || *c.Environment.Enabled
 }
 
 // UITheme normalizes ui.theme to a supported value.
@@ -137,6 +155,21 @@ func (c *Config) UIShortcutLayout() string {
 	}
 }
 
+// UICursorShape normalizes ui.cursor_shape. Defaults to "underline" to avoid
+// block-cursor visual corruption with CJK wide characters in the textarea
+// (Bubble Tea real-cursor + CJK column-counting drift). Valid values:
+// "block", "underline", "bar".
+func (c *Config) UICursorShape() string {
+	switch strings.ToLower(strings.TrimSpace(c.UI.CursorShape)) {
+	case "block":
+		return "block"
+	case "bar":
+		return "bar"
+	default:
+		return "underline"
+	}
+}
+
 func normalizeThemeStyle(style string) string {
 	switch strings.ToLower(strings.TrimSpace(style)) {
 	case "graphite", "aurora", "slate", "carbon", "nocturne", "amber", "ember", "midnight", "sandstone", "porcelain", "linen", "glacier":
@@ -152,6 +185,8 @@ func normalizeDesktopLayoutStyle(style string) string {
 		return "classic"
 	case "workbench", "workspace":
 		return "workbench"
+	case "creation":
+		return "creation"
 	default:
 		return "workbench"
 	}
@@ -236,6 +271,29 @@ func (c *Config) DesktopDisplayMode() string {
 	default:
 		return "standard"
 	}
+}
+
+// NormalizeToolApprovalMode returns the canonical desktop/session tool approval
+// posture. Unknown or missing values fall back to ask for safety.
+func NormalizeToolApprovalMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "auto":
+		return "auto"
+	case "yolo", "full", "full-access", "bypass":
+		return "yolo"
+	default:
+		return "ask"
+	}
+}
+
+// DesktopDefaultToolApprovalMode is the Ask/Auto/YOLO default used only when
+// creating a new desktop session. Existing tabs and restored sessions keep their
+// own persisted runtime state.
+func (c *Config) DesktopDefaultToolApprovalMode() string {
+	if c == nil {
+		return "ask"
+	}
+	return NormalizeToolApprovalMode(c.Desktop.DefaultToolApprovalMode)
 }
 
 // DesktopStatusBarStyle normalizes the desktop status bar metric label style.
@@ -324,6 +382,29 @@ func (c *Config) ColdResumePruneEnabled() bool {
 		return true
 	}
 	return *c.Agent.ColdResumePrune
+}
+
+// ResponseLanguage normalizes the top-level language preference for final
+// answers. Empty means auto: replies follow the current user turn.
+func (c *Config) ResponseLanguage() string {
+	if c == nil {
+		return "auto"
+	}
+	return NormalizeLanguage(c.Language)
+}
+
+// NormalizeLanguage returns one of auto|zh|en for UI/default reply language settings.
+func NormalizeLanguage(lang string) string {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "", "auto", "detect", "default":
+		return "auto"
+	case "zh", "cn", "chinese", "中文":
+		return "zh"
+	case "en", "english":
+		return "en"
+	default:
+		return "auto"
+	}
 }
 
 // ReasoningLanguage normalizes agent.reasoning_language. Empty means auto:
@@ -493,6 +574,27 @@ type BotConnectionSessionMapping struct {
 	UpdatedAt     string `toml:"updated_at"`
 }
 
+// ServeConfig controls the HTTP serve frontend security settings.
+type ServeConfig struct {
+	// AuthMode selects the authentication mode for the HTTP serve frontend.
+	// "none" (default): no authentication.
+	// "token": a pre-shared token in the URL query string.
+	// "password": a login page with bcrypt password verification.
+	AuthMode string `toml:"auth_mode"`
+	// Token is a pre-shared token for auth_mode = "token". When empty, a
+	// cryptographically random token is generated at startup and printed.
+	Token string `toml:"token"`
+	// PasswordHash is a bcrypt hash of the password for auth_mode = "password".
+	// Generate one with: reasonix serve --hash-password --password '...'
+	PasswordHash string `toml:"password_hash"`
+	// BehindProxy indicates the server sits behind a trusted reverse proxy
+	// (nginx, Caddy, Cloudflare, etc.) that sets X-Forwarded-For and
+	// X-Forwarded-Proto headers. When true, those headers are used for
+	// rate-limiting and Secure-cookie decisions. When false (default), they
+	// are ignored — an attacker can otherwise forge them.
+	BehindProxy bool `toml:"behind_proxy"`
+}
+
 // NetworkConfig controls ordinary outbound HTTP traffic such as model providers,
 // wallet-balance lookups, updater checks, CodeGraph downloads, and web_fetch.
 // web_fetch reuses these proxy settings while keeping its own SSRF-guarded
@@ -525,13 +627,13 @@ type NetworkProxyConfig struct {
 func (c *Config) NetworkProxySpec() netclient.ProxySpec {
 	return netclient.ProxySpec{
 		Mode:        c.Network.ProxyMode,
-		URL:         ExpandVars(c.Network.ProxyURL),
-		NoProxy:     ExpandVars(c.Network.NoProxy),
+		URL:         c.expandVars(c.Network.ProxyURL),
+		NoProxy:     c.expandVars(c.Network.NoProxy),
 		Type:        c.Network.Proxy.Type,
-		Server:      ExpandVars(c.Network.Proxy.Server),
+		Server:      c.expandVars(c.Network.Proxy.Server),
 		Port:        c.Network.Proxy.Port,
-		Username:    ExpandVars(c.Network.Proxy.Username),
-		Password:    ExpandVars(c.Network.Proxy.Password),
+		Username:    c.expandVars(c.Network.Proxy.Username),
+		Password:    c.expandVars(c.Network.Proxy.Password),
 		DirectHosts: c.directProxyHosts(),
 	}
 }
@@ -591,7 +693,7 @@ type SkillsConfig struct {
 func (c *Config) SkillCustomPaths() []string {
 	var out []string
 	for _, p := range c.Skills.Paths {
-		if p = ExpandVars(p); strings.TrimSpace(p) != "" {
+		if p = c.expandVars(p); strings.TrimSpace(p) != "" {
 			out = append(out, p)
 		}
 	}
@@ -603,7 +705,7 @@ func (c *Config) SkillCustomPaths() []string {
 func (c *Config) SkillExcludedPaths() []string {
 	var out []string
 	for _, p := range c.Skills.ExcludedPaths {
-		if p = ExpandVars(p); strings.TrimSpace(p) != "" {
+		if p = c.expandVars(p); strings.TrimSpace(p) != "" {
 			out = append(out, p)
 		}
 	}
@@ -668,11 +770,13 @@ func (c *Config) IsSkillDisabled(name string) bool {
 // (write_file / edit_file / multi_edit / move_file) may modify; empty means the
 // current working directory, so writes stay inside the project by default.
 // AllowWrite lists extra directories writers may also touch (e.g. a sibling repo
-// or a temp dir). Both support ${VAR} / ${VAR:-default} expansion. Reads are
+// or a temp dir). ForbidRead lists directories the agent may not read or list at all
+// (e.g. ~/.ssh for secrets). Both support ${VAR} / ${VAR:-default} expansion. Reads are
 // unrestricted; confining `bash` is Phase 1 (OS-level sandbox).
 type SandboxConfig struct {
 	WorkspaceRoot string   `toml:"workspace_root"`
 	AllowWrite    []string `toml:"allow_write"`
+	ForbidRead    []string `toml:"forbid_read"`
 	// Bash is the OS-sandbox mode for the bash tool: "enforce" (default) jails
 	// each command, "off" runs it unconfined. Phase 1; macOS only for now, with
 	// a graceful fallback elsewhere (see internal/sandbox).
@@ -695,7 +799,7 @@ func (c *Config) WriteRoots() []string {
 // config doesn't explicitly set a workspace_root. Desktop tabs pass their
 // project root here so tool confinement is correct without changing cwd.
 func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
-	root := ExpandVars(c.Sandbox.WorkspaceRoot)
+	root := c.expandVars(c.Sandbox.WorkspaceRoot)
 	if root == "" {
 		root = fallbackRoot
 		if root == "" || root == "." {
@@ -708,7 +812,38 @@ func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
 	}
 	roots := []string{root}
 	for _, d := range c.Sandbox.AllowWrite {
-		if d = ExpandVars(d); d != "" {
+		if d = c.expandVars(d); d != "" {
+			roots = append(roots, d)
+		}
+	}
+	return roots
+}
+
+// ForbidReadRoots returns the directories the agent is forbidden from reading
+// or listing, with ${VAR} expanded. Relative roots are resolved against the
+// current working directory; the confiner resolves them to symlink-free paths.
+// Empty when no forbid_read entries are configured.
+func (c *Config) ForbidReadRoots() []string {
+	return c.ForbidReadRootsForRoot(".")
+}
+
+// ForbidReadRootsForRoot is like ForbidReadRoots but uses fallbackRoot when
+// resolving relative paths (for desktop tabs that pass their project root).
+func (c *Config) ForbidReadRootsForRoot(fallbackRoot string) []string {
+	root := fallbackRoot
+	if root == "" || root == "." {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
+		} else {
+			root = "."
+		}
+	}
+	roots := make([]string, 0, len(c.Sandbox.ForbidRead))
+	for _, d := range c.Sandbox.ForbidRead {
+		if d = c.expandVars(d); d != "" {
+			if !filepath.IsAbs(d) {
+				d = filepath.Join(root, d)
+			}
 			roots = append(roots, d)
 		}
 	}
@@ -731,16 +866,18 @@ func (c *Config) BashMode() string {
 // each model's prompt prefix stays cache-stable). SubagentModel is the optional
 // default for runAs=subagent skills; SubagentModels overrides it per skill name.
 type AgentConfig struct {
-	SystemPrompt     string            `toml:"system_prompt"`
-	SystemPromptFile string            `toml:"system_prompt_file"`
-	MaxSteps         int               `toml:"max_steps"`         // tool-call rounds per turn; 0 = unlimited
-	PlannerMaxSteps  int               `toml:"planner_max_steps"` // planner read-only tool-call rounds; 0 = unlimited
-	Temperature      float64           `toml:"temperature"`
-	PlannerModel     string            `toml:"planner_model"`
-	SubagentModel    string            `toml:"subagent_model"`
-	SubagentModels   map[string]string `toml:"subagent_models"`
-	SubagentEffort   string            `toml:"subagent_effort"`
-	SubagentEfforts  map[string]string `toml:"subagent_efforts"`
+	SystemPrompt        string            `toml:"system_prompt"`
+	SystemPromptFile    string            `toml:"system_prompt_file"`
+	MaxSteps            int               `toml:"max_steps"`         // tool-call rounds per turn; 0 = unlimited
+	PlannerMaxSteps     int               `toml:"planner_max_steps"` // planner read-only tool-call rounds; 0 = unlimited
+	Temperature         float64           `toml:"temperature"`
+	PlannerModel        string            `toml:"planner_model"`
+	GuardianModel       string            `toml:"guardian_model"`
+	GuardianTemperature float64           `toml:"guardian_temperature"`
+	SubagentModel       string            `toml:"subagent_model"`
+	SubagentModels      map[string]string `toml:"subagent_models"`
+	SubagentEffort      string            `toml:"subagent_effort"`
+	SubagentEfforts     map[string]string `toml:"subagent_efforts"`
 	// OutputStyle selects a persona/tone block folded into the system prompt at
 	// startup (a built-in like "explanatory"/"learning"/"concise", or a custom
 	// .reasonix/output-styles/<name>.md). Empty = the unmodified prompt.
@@ -757,9 +894,10 @@ type AgentConfig struct {
 	// borderline auto-plan decisions. Empty keeps the zero-cost heuristic path.
 	AutoPlanClassifier string `toml:"auto_plan_classifier"`
 	// Compaction window fractions: soft = notice only, compact = trigger, force = hard ceiling.
-	SoftCompactRatio  float64 `toml:"soft_compact_ratio"`
-	CompactRatio      float64 `toml:"compact_ratio"`
-	CompactForceRatio float64 `toml:"compact_force_ratio"`
+	SoftCompactRatio    float64 `toml:"soft_compact_ratio"`
+	ToolResultSnipRatio float64 `toml:"tool_result_snip_ratio"`
+	CompactRatio        float64 `toml:"compact_ratio"`
+	CompactForceRatio   float64 `toml:"compact_force_ratio"`
 	// Keep controls which compactable messages stay verbatim beyond the current
 	// user-fact/digest floor and recent tail. Empty uses the conservative default
 	// of keeping error tool results.
@@ -768,29 +906,78 @@ type AgentConfig struct {
 	// ColdResumePrune elides stale tool results when a session reopens past the
 	// provider cache window. nil = default enabled.
 	ColdResumePrune *bool `toml:"cold_resume_prune"`
-	// PlanModeAllowedTools names tools that are exempt from the plan-mode read-only
-	// gate. When a tool named here is called while in plan mode, it executes without
-	// the "plan mode is read-only" block. Use sparingly — prefer the built-in safe
-	// bash commands for read-only exploration.
+	// PlanModeAllowedTools names extra custom tools the plan-mode policy may treat
+	// as read-only. It cannot unlock known blocked tools or unsafe bash commands.
 	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
+	// MemoryCompiler controls the v5 execution-memory compiler. Missing configs
+	// default to enabled so users get the self-improving planner unless they opt
+	// out explicitly.
+	MemoryCompiler MemoryCompilerConfig `toml:"memory_compiler"`
+}
+
+// MemoryCompilerConfig controls the v5 execution-memory compiler.
+type MemoryCompilerConfig struct {
+	Enabled   *bool  `toml:"enabled"`
+	Verbosity string `toml:"verbosity"`
+}
+
+const (
+	MemoryCompilerVerbosityObserve = "observe"
+	MemoryCompilerVerbosityCompact = "compact"
+)
+
+// MemoryCompilerEnabled reports whether the v5 execution-memory compiler should
+// participate in future turns. Missing config defaults to true.
+func (c *Config) MemoryCompilerEnabled() bool {
+	if c == nil || c.Agent.MemoryCompiler.Enabled == nil {
+		return true
+	}
+	return *c.Agent.MemoryCompiler.Enabled
+}
+
+// MemoryCompilerVerbosity reports how much Memory v5 state should be injected
+// into model-facing turns. The default observes and learns without prompt
+// injection, so Memory v5 IR is not provider-visible unless opted in.
+func (c *Config) MemoryCompilerVerbosity() string {
+	if c == nil {
+		return MemoryCompilerVerbosityObserve
+	}
+	return NormalizeMemoryCompilerVerbosity(c.Agent.MemoryCompiler.Verbosity)
+}
+
+// NormalizeMemoryCompilerVerbosity accepts current and legacy spellings for the
+// Memory v5 injection mode.
+func NormalizeMemoryCompilerVerbosity(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "observe", "observed", "silent", "minimal", "none":
+		return MemoryCompilerVerbosityObserve
+	case "compact", "inject", "injected", "contract", "on":
+		return MemoryCompilerVerbosityCompact
+	default:
+		return MemoryCompilerVerbosityObserve
+	}
 }
 
 // ProviderEntry declares a model provider instance. ContextWindow is the model's
 // token budget; the harness compacts older history as a turn's prompt approaches
 // it (see agent compaction). 0 disables compaction for the instance.
 type ProviderEntry struct {
-	Name          string                       `toml:"name"`
-	Kind          string                       `toml:"kind"`
-	BaseURL       string                       `toml:"base_url"`
-	Model         string                       `toml:"model"`      // a single model (back-compat)
-	Models        []string                     `toml:"models"`     // a vendor's model list (one base_url/key, many models)
-	ModelsURL     string                       `toml:"models_url"` // auto-fetch models from this URL on startup
-	Default       string                       `toml:"default"`    // default model when Models is set (else Models[0])
-	APIKeyEnv     string                       `toml:"api_key_env"`
-	BalanceURL    string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
-	ContextWindow int                          `toml:"context_window"`
-	Price         *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
-	Prices        map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
+	Name           string            `toml:"name"`
+	Kind           string            `toml:"kind"`
+	BaseURL        string            `toml:"base_url"`
+	ChatURL        string            `toml:"chat_url"`
+	Model          string            `toml:"model"`      // a single model (back-compat)
+	Models         []string          `toml:"models"`     // a vendor's model list (one base_url/key, many models)
+	ModelsURL      string            `toml:"models_url"` // auto-fetch models from this URL on startup
+	Default        string            `toml:"default"`    // default model when Models is set (else Models[0])
+	APIKeyEnv      string            `toml:"api_key_env"`
+	Headers        map[string]string `toml:"headers"` // optional extra HTTP headers for OpenAI-compatible gateways; secrets should stay in api_key_env.
+	resolvedAPIKey string
+	resolvedSource CredentialSource
+	BalanceURL     string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
+	ContextWindow  int                          `toml:"context_window"`
+	Price          *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
+	Prices         map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
 	// Thinking / Effort are provider-kind-specific knobs forwarded to the provider
 	// via Config.Extra. The anthropic provider reads Thinking="adaptive" to enable
 	// extended thinking and Effort ("low".."max") to tune depth. The
@@ -826,9 +1013,22 @@ type ProviderEntry struct {
 	// DefaultEffort is the /effort level used when the user picks "auto" or
 	// has not set Effort. Ignored when SupportedEfforts is empty.
 	DefaultEffort string `toml:"default_effort"`
+	// ModelOverrides customizes capability metadata after ResolveModel selects a
+	// concrete model from a multi-model provider. Use it when a gateway exposes
+	// mixed DeepSeek/OpenAI/no-reasoning or mixed vision/text models under one
+	// base_url/key.
+	ModelOverrides map[string]ProviderModelOverride `toml:"model_overrides"`
+	visionOverride *bool
 	// NoProxy reaches this provider's base_url directly, never through the proxy.
 	// For China-only endpoints a foreign-exit proxy resets the TLS handshake (#2803).
 	NoProxy bool `toml:"no_proxy"`
+}
+
+type ProviderModelOverride struct {
+	ReasoningProtocol string   `toml:"reasoning_protocol"`
+	SupportedEfforts  []string `toml:"supported_efforts"`
+	DefaultEffort     string   `toml:"default_effort"`
+	Vision            *bool    `toml:"vision"`
 }
 
 // ModelList returns the models this provider exposes: the explicit `models` list,
@@ -954,6 +1154,44 @@ func (e *ProviderEntry) applyModelPrice() {
 	e.Price = e.PriceForModel(e.Model)
 }
 
+func (e *ProviderEntry) applyModelOverride() {
+	if e == nil || len(e.ModelOverrides) == 0 {
+		return
+	}
+	ov, ok := e.modelOverrideForModel(e.Model)
+	if !ok {
+		return
+	}
+	if ov.ReasoningProtocol != "" {
+		e.ReasoningProtocol = ov.ReasoningProtocol
+	}
+	if ov.SupportedEfforts != nil {
+		e.SupportedEfforts = append([]string(nil), ov.SupportedEfforts...)
+	}
+	if ov.DefaultEffort != "" || ov.SupportedEfforts != nil {
+		e.DefaultEffort = ov.DefaultEffort
+	}
+	if ov.Vision != nil {
+		e.visionOverride = ov.Vision
+	}
+}
+
+func (e *ProviderEntry) modelOverrideForModel(model string) (ProviderModelOverride, bool) {
+	model = strings.TrimSpace(model)
+	if e == nil || model == "" || len(e.ModelOverrides) == 0 {
+		return ProviderModelOverride{}, false
+	}
+	if ov, ok := e.ModelOverrides[model]; ok {
+		return ov, true
+	}
+	for k, ov := range e.ModelOverrides {
+		if strings.EqualFold(strings.TrimSpace(k), model) {
+			return ov, true
+		}
+	}
+	return ProviderModelOverride{}, false
+}
+
 func clonePricing(p *provider.Pricing) *provider.Pricing {
 	if p == nil {
 		return nil
@@ -964,15 +1202,17 @@ func clonePricing(p *provider.Pricing) *provider.Pricing {
 
 // ToolsConfig selects which built-in tools are enabled. Empty means all of them.
 type ToolsConfig struct {
-	Enabled            []string             `toml:"enabled"`
-	BashTimeoutSeconds *int                 `toml:"bash_timeout_seconds"`
-	BackgroundJobs     BackgroundJobsConfig `toml:"background_jobs"`
-	Search             SearchConfig         `toml:"search"`
-	Shell              ShellConfig          `toml:"shell"`
+	Enabled               []string             `toml:"enabled"`
+	BashTimeoutSeconds    *int                 `toml:"bash_timeout_seconds"`
+	MCPCallTimeoutSeconds *int                 `toml:"mcp_call_timeout_seconds"`
+	BackgroundJobs        BackgroundJobsConfig `toml:"background_jobs"`
+	Search                SearchConfig         `toml:"search"`
+	Shell                 ShellConfig          `toml:"shell"`
 }
 
 const (
 	defaultBashTimeoutSeconds             = 120
+	defaultMCPCallTimeoutSeconds          = 300
 	defaultBackgroundJobStalledWarningSec = 900
 	maxBackgroundJobStalledWarningSec     = 86400
 )
@@ -986,6 +1226,16 @@ func (c *Config) BashTimeoutSeconds() int {
 		return defaultBashTimeoutSeconds
 	}
 	return *c.Tools.BashTimeoutSeconds
+}
+
+// MCPCallTimeoutSeconds returns the default MCP JSON-RPC call timeout in
+// seconds. Omitted, zero, and negative values keep the built-in safety cap so a
+// hung MCP server cannot block a turn indefinitely.
+func (c *Config) MCPCallTimeoutSeconds() int {
+	if c.Tools.MCPCallTimeoutSeconds == nil || *c.Tools.MCPCallTimeoutSeconds <= 0 {
+		return defaultMCPCallTimeoutSeconds
+	}
+	return *c.Tools.MCPCallTimeoutSeconds
 }
 
 // BackgroundJobsConfig tunes parent-created background jobs.
@@ -1052,29 +1302,41 @@ type PluginEntry struct {
 	Env     map[string]string `toml:"env"`
 	URL     string            `toml:"url"`
 	Headers map[string]string `toml:"headers"`
+	// CallTimeoutSeconds overrides the default per-call deadline for this MCP
+	// server. Zero falls back to [tools].mcp_call_timeout_seconds.
+	CallTimeoutSeconds int `toml:"call_timeout_seconds"`
+	// ToolTimeoutSeconds overrides the per-call deadline for raw MCP tool names
+	// from this server. Keys are server-local tool names, not model-visible
+	// mcp__server__tool names.
+	ToolTimeoutSeconds map[string]int `toml:"tool_timeout_seconds"`
+	// TrustedReadOnlyTools names raw MCP tool names that Reasonix should treat as
+	// trusted read-only for planner / plan-mode / read-only research surfaces.
+	// Use this only for tools whose semantics are known to be side-effect free.
+	TrustedReadOnlyTools []string `toml:"trusted_read_only_tools"`
 	// AutoStart controls whether the server connects during session startup.
 	// Nil preserves historical behavior: configured servers start automatically.
 	AutoStart *bool `toml:"auto_start"`
-	// Tier selects how aggressively the server is connected at boot:
+	// Tier is a legacy compatibility field. New config rendering omits it; enabled
+	// MCP servers connect automatically in the background unless auto_start=false.
+	// Historical values are accepted for old files:
 	//   "eager"      — blocks startup until the handshake completes; required for
 	//                  servers whose tools the system prompt depends on.
-	//   "lazy"       — registers placeholder tools immediately (from on-disk
-	//                  schema cache when available) and only spawns the real
-	//                  subprocess on first model use. Kept for legacy configs.
+	//   "lazy"       — legacy alias for background.
 	//   "background" — placeholder + spawn fired at boot but not waited on;
 	//                  swap happens once the spawn finishes.
 	// Empty defaults to "background" so enabled MCPs connect automatically
-	// without blocking chat. Unknown non-empty values fall back to "lazy".
-	Tier string `toml:"tier"`
+	// without blocking chat. Unknown non-empty values fall back to "background".
+	Tier         string `toml:"tier"`
+	expansionEnv map[string]string
 }
 
 func (e PluginEntry) ShouldAutoStart() bool {
 	return e.AutoStart == nil || *e.AutoStart
 }
 
-// ResolvedTier returns the normalized tier ("eager"|"lazy"|"background") with
-// the project default applied. Unknown values fall back to "lazy" so a typo
-// never forces a slow boot.
+// ResolvedTier returns the normalized tier ("eager"|"background") with the
+// project default applied. Legacy lazy and unknown values fall back to
+// background so enabled MCPs are available without manual connection.
 func (e PluginEntry) ResolvedTier() string {
 	return resolvedMCPTier(e.Tier)
 }
@@ -1083,12 +1345,12 @@ func resolvedMCPTier(tier string) string {
 	switch strings.ToLower(strings.TrimSpace(tier)) {
 	case "eager":
 		return "eager"
-	case "background":
+	case "background", "lazy":
 		return "background"
 	case "":
 		return "background"
 	default:
-		return "lazy"
+		return "background"
 	}
 }
 
@@ -1107,19 +1369,16 @@ const DefaultSystemPrompt = `You are Reasonix, a coding agent focused on executi
 Use the provided tools to read and write files and run shell commands.
 Principles: understand the request before acting; verify with tools instead of
 guessing; keep changes minimal and correct; briefly summarize what you did.
-When the request leaves a real choice to the user — which approach or library,
-the scope, or a consequential or ambiguous decision — call the ask tool to offer
-2-4 concrete options rather than guessing or burying the question in prose. Skip
-it when there's an obvious default; don't ask just to confirm. Approval-bypass
-modes do not answer ask questions or approve plans for the user. If no
-interactive user is available, the ask tool returns a model-assumption fallback;
-state the assumption you made before proceeding.
 For multi-step work, track progress with the todo_write tool: lay out the steps,
 keep exactly one in_progress, and flip each to completed as you finish it — update
 the list as you go, not just at the end.
 In plan mode the harness blocks writer tools: do read-only research, then write a
 concise plan as your reply and stop. The user is asked to approve before anything
 is changed; once approved, work through the steps, updating the task list as you go.`
+
+// UserDecisionPolicy is appended to every system prompt, including user-custom
+// prompts, so custom personas cannot accidentally remove the `ask` UI contract.
+const UserDecisionPolicy = `User-owned choices: when a real decision belongs to the user — scope, approach, library, risk, manual validation, or any ambiguous or consequential path — and there is no obvious safe default, call the ask tool with 2-4 concrete options so the UI shows a choice. Do not ask in prose, infer a choice from silence, or continue by choosing for the user; do not choose for the user. Tool-approval bypass modes do not answer ask questions or approve plans. If no interactive user is available, the ask tool returns a model-assumption fallback; state that assumption and choose the safest reversible path.`
 
 // LanguagePolicy is the auto fallback appended to the system prompt when no
 // concrete UI language is resolved. It is static English text, so it stays part
@@ -1129,7 +1388,7 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 	`whenever they switch. Let this also guide the language you think in. Always keep code, ` +
 	`identifiers, file paths, shell commands, and technical terms in their original form — never translate them.`
 
-// Default returns the built-in default configuration (DeepSeek + MiMo presets).
+// Default returns the built-in default configuration.
 func Default() *Config {
 	return &Config{
 		ConfigVersion:    3,
@@ -1148,12 +1407,13 @@ func Default() *Config {
 			// the user cancels, or the provider errors. Context stays bounded by
 			// compaction, not by a round count. Set a positive agent.max_steps only
 			// if you want a hard guard against runaway.
-			MaxSteps:          0,
-			PlannerMaxSteps:   12,
-			AutoPlan:          "off",
-			SoftCompactRatio:  0.5,
-			CompactRatio:      0.8,
-			CompactForceRatio: 0.9,
+			MaxSteps:            0,
+			PlannerMaxSteps:     0,
+			AutoPlan:            "off",
+			SoftCompactRatio:    0.5,
+			ToolResultSnipRatio: 0.6,
+			CompactRatio:        0.8,
+			CompactForceRatio:   0.9,
 		},
 		// Mode "ask" with no rules keeps `reasonix run` autonomous (no TTY → ask
 		// resolves to allow) while `reasonix` prompts before writers. Users add
@@ -1180,1594 +1440,16 @@ func Default() *Config {
 		Providers: []ProviderEntry{
 			{Name: "deepseek-flash", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4FlashPrice()},
 			{Name: "deepseek-pro", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4ProPrice()},
-			{Name: "mimo-pro", Kind: "openai", BaseURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5-pro", APIKeyEnv: "MIMO_API_KEY", ContextWindow: 1_000_000, Price: mimoV25ProPrice(), NoProxy: true},
-			{Name: "mimo-flash", Kind: "openai", BaseURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5", APIKeyEnv: "MIMO_API_KEY", ContextWindow: 1_000_000, Price: mimoV25Price(), NoProxy: true},
 		},
 	}
 }
 
-func deepSeekV4FlashPrice() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.02, Input: 1, Output: 2, Currency: "¥"}
-}
-
-func deepSeekV4ProPrice() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.025, Input: 3, Output: 6, Currency: "¥"}
-}
-
-func deepSeekV4Prices() map[string]*provider.Pricing {
-	return map[string]*provider.Pricing{
-		"deepseek-v4-flash": deepSeekV4FlashPrice(),
-		"deepseek-v4-pro":   deepSeekV4ProPrice(),
-	}
-}
-
-func deepSeekV4FlashPriceUSD() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.0028, Input: 0.14, Output: 0.28, Currency: "$"}
-}
-
-func deepSeekV4ProPriceUSD() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.003625, Input: 0.435, Output: 0.87, Currency: "$"}
-}
-
-func deepSeekV4PricesUSD() map[string]*provider.Pricing {
-	return map[string]*provider.Pricing{
-		"deepseek-v4-flash": deepSeekV4FlashPriceUSD(),
-		"deepseek-v4-pro":   deepSeekV4ProPriceUSD(),
-	}
-}
-
-// DeepSeekV4PricesForLanguage keeps the settings/template call site stable while
-// official DeepSeek defaults move to RMB. Persisted prices still win; this is
-// only used for templates and missing-default backfills.
-func DeepSeekV4PricesForLanguage(lang string) map[string]*provider.Pricing {
-	_ = lang
-	return deepSeekV4Prices()
-}
-
-func deepSeekV4PricesForConfig(c *Config) map[string]*provider.Pricing {
-	_ = c
-	return deepSeekV4Prices()
-}
-
-func deepSeekV4PriceForModel(lang, model string) *provider.Pricing {
-	_ = lang
-	return clonePricing(deepSeekV4Prices()[strings.TrimSpace(model)])
-}
-
-// DeepSeekOfficialPricingLanguage is retained for settings/template compatibility.
-// Official DeepSeek providers now seed RMB prices by default; explicit user
-// prices in config still override these defaults.
-func (c *Config) DeepSeekOfficialPricingLanguage() string {
-	_ = c
-	return "zh"
-}
-
-// ApplyDeepSeekOfficialDefaultPricing refreshes built-in/official DeepSeek
-// prices that still match known official defaults. Custom user prices are left
-// untouched.
-func (c *Config) ApplyDeepSeekOfficialDefaultPricing() {
-	applyDeepSeekOfficialDefaultPricing(c)
-}
-
-func applyDeepSeekOfficialDefaultPricing(c *Config) {
-	if c == nil {
-		return
-	}
-	lang := c.DeepSeekOfficialPricingLanguage()
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if officialProviderKind(p) != "deepseek" {
-			continue
-		}
-		if isKnownDeepSeekOfficialPricing(p.Model, p.Price) {
-			p.Price = deepSeekV4PriceForModel(lang, p.Model)
-		}
-		for model, price := range p.Prices {
-			if isKnownDeepSeekOfficialPricing(model, price) {
-				p.Prices[model] = deepSeekV4PriceForModel(lang, model)
-			}
-		}
-	}
-}
-
-func mimoV25ProPrice() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.025, Input: 3, Output: 6, Currency: "¥"}
-}
-
-func mimoV25Price() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.02, Input: 1, Output: 2, Currency: "¥"}
-}
-
-func mimoV2FlashPrice() *provider.Pricing {
-	return &provider.Pricing{CacheHit: 0.07, Input: 0.70, Output: 2.10, Currency: "¥"}
-}
-
-func mimoDomesticPrices(models []string) map[string]*provider.Pricing {
-	prices := map[string]*provider.Pricing{}
-	for _, model := range models {
-		switch strings.TrimSpace(model) {
-		case "mimo-v2.5-pro", "mimo-v2-pro":
-			prices[model] = mimoV25ProPrice()
-		case "mimo-v2.5", "mimo-v2-omni":
-			prices[model] = mimoV25Price()
-		case "mimo-v2-flash":
-			prices[model] = mimoV2FlashPrice()
-		}
-	}
-	return prices
-}
-
-func backfillMimoDomesticPrices(e *ProviderEntry) {
-	if e == nil {
-		return
-	}
-	defaults := mimoDomesticPrices(e.ModelList())
-	if len(defaults) == 0 {
-		return
-	}
-	if e.Prices == nil {
-		e.Prices = map[string]*provider.Pricing{}
-	}
-	for model, price := range defaults {
-		if e.Prices[model] == nil {
-			e.Prices[model] = clonePricing(price)
-		}
-	}
-}
-
-// ResetOfficialProviderPricingOnUpgrade resets official DeepSeek/MiMo prices to
-// the current built-in RMB defaults once for desktop upgrades. It intentionally
-// runs from the desktop app startup path, not every config Load(), so user edits
-// made after the upgrade are preserved.
-func ResetOfficialProviderPricingOnUpgrade(path string) (bool, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return false, nil
-	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	var header Config
-	if _, err := toml.DecodeFile(path, &header); err != nil {
-		return false, fmt.Errorf("config %s: %w", path, err)
-	}
-	if header.ConfigVersion >= Default().ConfigVersion {
-		return false, nil
-	}
-	cfg := LoadForEdit(path)
-	resetOfficialProviderPricingDefaults(cfg)
-	cfg.ConfigVersion = Default().ConfigVersion
-	if err := cfg.SaveTo(path); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func resetOfficialProviderPricingDefaults(c *Config) {
-	if c == nil {
-		return
-	}
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		switch {
-		case officialProviderKind(p) == "deepseek":
-			resetDeepSeekOfficialPricing(p)
-		case isOfficialMimoAPIProvider(p), isOfficialMimoTokenPlanProvider(p):
-			resetMimoOfficialPricing(p)
-		}
-	}
-}
-
-func resetDeepSeekOfficialPricing(p *ProviderEntry) {
-	if p == nil {
-		return
-	}
-	defaults := deepSeekV4Prices()
-	p.Price = nil
-	if strings.TrimSpace(p.Model) != "" && len(p.Models) == 0 {
-		if price := defaults[strings.TrimSpace(p.Model)]; price != nil {
-			p.Price = clonePricing(price)
-			p.Prices = nil
-			return
-		}
-	}
-	if p.Prices == nil {
-		p.Prices = map[string]*provider.Pricing{}
-	}
-	for model, price := range defaults {
-		if p.HasModel(model) {
-			p.Prices[model] = clonePricing(price)
-		}
-	}
-}
-
-func resetMimoOfficialPricing(p *ProviderEntry) {
-	if p == nil {
-		return
-	}
-	defaults := mimoDomesticPrices(p.ModelList())
-	if len(defaults) == 0 {
-		return
-	}
-	p.Price = nil
-	if strings.TrimSpace(p.Model) != "" && len(p.Models) == 0 {
-		if price := defaults[strings.TrimSpace(p.Model)]; price != nil {
-			p.Price = clonePricing(price)
-			p.Prices = nil
-			return
-		}
-	}
-	p.Prices = map[string]*provider.Pricing{}
-	for model, price := range defaults {
-		p.Prices[model] = clonePricing(price)
-	}
-}
-
-func isKnownDeepSeekOfficialPricing(model string, price *provider.Pricing) bool {
-	model = strings.TrimSpace(model)
-	if model == "" || price == nil {
-		return false
-	}
-	for _, prices := range []map[string]*provider.Pricing{deepSeekV4Prices(), deepSeekV4PricesUSD()} {
-		if samePricing(price, prices[model]) {
-			return true
-		}
-	}
-	return false
-}
-
-func samePricing(a, b *provider.Pricing) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	return a.CacheHit == b.CacheHit && a.Input == b.Input && a.Output == b.Output && a.Currency == b.Currency
-}
-
-// Load builds the configuration: defaults, then user config, then project
-// config, then MCP servers from Claude Code's .mcp.json, then (lowest priority)
-// the v0.x ~/.reasonix/config.json's mcpServers. A .env in the working directory
-// is loaded first so api_key_env can resolve.
-func Load() (*Config, error) {
-	return LoadForRoot(".")
-}
-
-// LoadForRoot builds the configuration with project files resolved from root
-// instead of the current working directory. When root is "" or ".", it behaves
-// like Load(). This is the workspace-aware entry point: desktop tabs use it so
-// each project's reasonix.toml + .env + .mcp.json are resolved independently
-// without changing the process cwd.
-func LoadForRoot(root string) (*Config, error) {
-	root = resolveRoot(root)
-	loadDotEnvForRoot(root)
-	cfg := Default()
-	cfg.CredentialsStore = credentialsStoreMode()
-
-	projectTOML := "reasonix.toml"
-	if root != "." {
-		projectTOML = filepath.Join(root, "reasonix.toml")
-	}
-
-	var tomlSources []string
-	if uc := userConfigLoadPath(); uc != "" {
-		tomlSources = append(tomlSources, uc)
-	}
-	tomlSources = append(tomlSources, projectTOML)
-	for _, path := range tomlSources {
-		if _, err := os.Stat(path); err == nil {
-			if err := migrateLegacyMCPTiersFile(path); err != nil {
-				slog.Warn("config: legacy mcp tier migration failed", "path", path, "err", err)
-			}
-		}
-		if err := mergeFile(cfg, path); err != nil {
-			return nil, err
-		}
-	}
-	// toml.DecodeFile replaces [[plugins]] wholesale, so cfg.Plugins now holds
-	// only the last file's. Re-merge by name across all sources (later wins) so a
-	// project reasonix.toml doesn't drop the global config's MCP servers.
-	plugins, err := mergeTOMLPlugins(tomlSources)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Plugins = plugins
-	if providers, providerSources, shadowedProjectProviders, ok, err := mergeTOMLProviders(tomlSources); err != nil {
-		return nil, err
-	} else if ok {
-		cfg.Providers = providers
-		cfg.providerSources = providerSources
-		cfg.shadowedProjectProviders = shadowedProjectProviders
-	}
-	if access, ok, err := mergeTOMLProviderAccess(tomlSources); err != nil {
-		return nil, err
-	} else if ok {
-		cfg.Desktop.ProviderAccess = access
-	}
-
-	// Claude Code's .mcp.json (project root) is read last and merged into
-	// [[plugins]], so a server configured for Claude works here unchanged.
-	// reasonix.toml wins on a name collision (see mergeMCPJSON).
-	mcpFile := mcpJSONFile
-	if root != "." {
-		mcpFile = filepath.Join(root, mcpJSONFile)
-	}
-	entries, err := loadMCPJSON(mcpFile)
-	if err != nil {
-		return nil, err
-	}
-	cfg.mergeMCPJSON(entries)
-
-	// Lowest priority: the v0.x ~/.reasonix/config.json's mcpServers, so upgrading
-	// from the TypeScript line keeps MCP servers without rewriting them. Anything
-	// the v2 config or .mcp.json already declared wins on a name collision.
-	cfg.mergeMCPJSON(loadLegacyMCP(legacyConfigPath()))
-	normalizePluginCommandLines(cfg)
-	normalizeLegacyEffort(cfg)
-	normalizeLegacyMCPTiers(cfg)
-	normalizeLegacyProviderModels(cfg)
-	normalizeDesktopOfficialProviderAccess(cfg)
-	normalizeOfficialDeepSeekModels(cfg)
-	applyDeepSeekOfficialDefaultPricing(cfg)
-	backfillDeepSeekOfficialPrices(cfg)
-	normalizeEffortConfig(cfg)
-	backfillDeepSeekPro(cfg)
-	cfg.CredentialsStore = credentialsStoreMode()
-	return cfg, nil
-}
-
-// backfillDeepSeekPro restores deepseek-pro for configs the pre-fix setup wizard
-// wrote with only deepseek-v4-flash: a keyless /models probe used to drop the Pro
-// SKU, leaving users unable to switch to it. In-memory only — the user's file is
-// untouched. Narrowly scoped to the official DeepSeek endpoint (which is known to
-// serve pro) so a custom flash-only deployment isn't given an entry that 404s.
-func backfillDeepSeekPro(c *Config) {
-	const flashModel, proModel = "deepseek-v4-flash", "deepseek-v4-pro"
-	var flash *ProviderEntry
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if p.Name == "deepseek-pro" {
-			return
-		}
-		for _, m := range p.ModelList() {
-			switch m {
-			case proModel:
-				return // pro already reachable
-			case flashModel:
-				if strings.Contains(p.BaseURL, "api.deepseek.com") {
-					flash = p
-				}
-			}
-		}
-	}
-	if flash == nil {
-		return
-	}
-	// If the user has explicitly curated a model list for the flash provider
-	// (e.g. unchecked pro in Settings), respect that choice and do not backfill.
-	if len(flash.Models) > 0 {
-		return
-	}
-	for _, bp := range Default().Providers {
-		if bp.Name == "deepseek-pro" {
-			bp.APIKeyEnv = flash.APIKeyEnv
-			bp.Price = deepSeekV4PriceForModel(c.DeepSeekOfficialPricingLanguage(), proModel)
-			c.Providers = append(c.Providers, bp)
-			return
-		}
-	}
-}
-
-func backfillDeepSeekOfficialPrices(c *Config) {
-	if c == nil {
-		return
-	}
-	defaults := deepSeekV4PricesForConfig(c)
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if officialProviderKind(p) != "deepseek" {
-			continue
-		}
-		if p.Price != nil {
-			continue
-		}
-		if p.Prices == nil {
-			p.Prices = map[string]*provider.Pricing{}
-		}
-		for model, price := range defaults {
-			if p.HasModel(model) && p.Prices[model] == nil {
-				p.Prices[model] = clonePricing(price)
-			}
-		}
-	}
-}
-
-func officialProviderKind(p *ProviderEntry) string {
-	if p == nil {
-		return ""
-	}
-	u, err := url.Parse(strings.TrimSpace(p.BaseURL))
-	if err != nil {
-		return ""
-	}
-	if strings.EqualFold(u.Hostname(), "api.deepseek.com") {
-		return "deepseek"
-	}
-	return ""
-}
-
-func resolveRoot(root string) string {
-	if root == "" || root == "." {
-		return "."
-	}
-	return filepath.Clean(root)
-}
-
-// normalizeLegacyEffort migrates the retired DeepSeek effort="off" (the old
-// /thinking off that disabled thinking) to the provider default, so a config
-// written by an older version keeps loading instead of erroring on a value the
-// provider no longer accepts.
-func normalizeLegacyEffort(c *Config) {
-	for i := range c.Providers {
-		if strings.EqualFold(strings.TrimSpace(c.Providers[i].Effort), "off") {
-			c.Providers[i].Effort = ""
-		}
-	}
-}
-
-// mergeTOMLPlugins merges [[plugins]] across TOML sources by name (later source wins).
-func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
-	var merged []PluginEntry
-	index := map[string]int{}
-	for _, path := range paths {
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		var f Config
-		if _, err := toml.DecodeFile(path, &f); err != nil {
-			return nil, fmt.Errorf("config %s: %w", path, err)
-		}
-		for _, p := range f.Plugins {
-			p, _ = NormalizePluginCommandLine(p)
-			if i, ok := index[p.Name]; ok {
-				merged[i] = p
-				continue
-			}
-			index[p.Name] = len(merged)
-			merged = append(merged, p)
-		}
-	}
-	return merged, nil
-}
-
-// mergeTOMLProviders merges [[providers]] across TOML sources by provider name.
-// User-global providers win over same-named project providers; project providers
-// only fill names the global config does not define. Keep official legacy aliases
-// distinct here: they can carry different default models and effort capabilities,
-// and the later desktop normalization layer handles canonical Settings access.
-func mergeTOMLProviders(paths []string) ([]ProviderEntry, map[string]providerSourceScope, []ProviderEntry, bool, error) {
-	var merged []ProviderEntry
-	var shadowedProject []ProviderEntry
-	index := map[string]int{}
-	sources := map[string]providerSourceScope{}
-	saw := false
-	for _, path := range paths {
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		var f Config
-		if _, err := toml.DecodeFile(path, &f); err != nil {
-			return nil, nil, nil, false, fmt.Errorf("config %s: %w", path, err)
-		}
-		if len(f.Providers) == 0 {
-			continue
-		}
-		saw = true
-		source := providerSourceForPath(path)
-		for _, p := range f.Providers {
-			normalizeProviderEffortFields(&p)
-			key := providerMergeKey(p)
-			if i, ok := index[key]; ok {
-				if sources[key] == providerSourceProject && source == providerSourceUser {
-					shadowedProject = append(shadowedProject, merged[i])
-					merged[i] = p
-					sources[key] = source
-				} else if sources[key] == providerSourceUser && source == providerSourceProject {
-					shadowedProject = append(shadowedProject, p)
-				}
-				continue
-			} else {
-				index[key] = len(merged)
-				merged = append(merged, p)
-				sources[key] = source
-			}
-		}
-	}
-	return merged, sources, shadowedProject, saw, nil
-}
-
-func providerSourceForPath(path string) providerSourceScope {
-	if isUserConfigPath(path) {
-		return providerSourceUser
-	}
-	return providerSourceProject
-}
-
-func providerMergeKey(p ProviderEntry) string {
-	return strings.TrimSpace(p.Name)
-}
-
-// mergeTOMLProviderAccess merges desktop.provider_access across TOML sources so
-// project desktop settings do not hide account-level providers from the desktop
-// model switcher.
-func mergeTOMLProviderAccess(paths []string) ([]string, bool, error) {
-	var merged []string
-	seen := map[string]bool{}
-	saw := false
-	for _, path := range paths {
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		var f Config
-		meta, err := toml.DecodeFile(path, &f)
-		if err != nil {
-			return nil, false, fmt.Errorf("config %s: %w", path, err)
-		}
-		if !meta.IsDefined("desktop", "provider_access") {
-			continue
-		}
-		saw = true
-		for _, name := range f.Desktop.ProviderAccess {
-			name = strings.TrimSpace(name)
-			if name == "" || seen[name] {
-				continue
-			}
-			seen[name] = true
-			merged = append(merged, name)
-		}
-	}
-	return merged, saw, nil
-}
-
-// LoadForEdit returns a config to seed the `reasonix setup` wizard when reconfiguring:
-// the built-in defaults with the file at path (if present) decoded on top, so a
-// reconfigure preserves the user's existing providers and agent settings instead
-// of resetting to defaults. .env is loaded so api_key_env resolution works while
-// the wizard decides which keys are still missing.
-func LoadForEdit(path string) *Config {
-	cfg, err := loadForEditStrict(path, true)
-	if err == nil {
-		return cfg
-	}
-	slog.Warn("config: load for edit failed, using defaults", "path", path, "err", err)
-	loadDotEnvForEditPath(path)
-	cfg = Default()
-	normalizeConfigForEdit(cfg)
-	return cfg
-}
-
-func LoadForEditWithoutCredentials(path string) *Config {
-	cfg, err := loadForEditStrict(path, false)
-	if err == nil {
-		return cfg
-	}
-	slog.Warn("config: load for edit failed, using defaults", "path", path, "err", err)
-	cfg = Default()
-	normalizeConfigForEdit(cfg)
-	return cfg
-}
-
-func loadForEditStrict(path string, loadCredentials bool) (*Config, error) {
-	if loadCredentials {
-		loadDotEnvForEditPath(path)
-	}
-	cfg := Default()
-	if _, err := os.Stat(path); err == nil {
-		if err := migrateLegacyMCPTiersFile(path); err != nil {
-			return nil, fmt.Errorf("config %s: %w", path, err)
-		}
-	}
-	if err := mergeFile(cfg, path); err != nil {
-		return nil, err
-	}
-	normalizeConfigForEdit(cfg)
-	return cfg, nil
-}
-
-func normalizeConfigForEdit(cfg *Config) {
-	normalizePluginCommandLines(cfg)
-	normalizeLegacyEffort(cfg)
-	normalizeLegacyMCPTiers(cfg)
-	normalizeLegacyProviderModels(cfg)
-	normalizeDesktopOfficialProviderAccess(cfg)
-	applyDeepSeekOfficialDefaultPricing(cfg)
-	backfillDeepSeekOfficialPrices(cfg)
-	normalizeEffortConfig(cfg)
-}
-
-func loadDotEnvForEditPath(path string) {
-	path = strings.TrimSpace(path)
-	if path == "" || isUserConfigPath(path) {
-		loadDotEnv()
-		return
-	}
-	loadDotEnvForRoot(filepath.Dir(path))
-}
-
-// mergeFile decodes a TOML file onto cfg if it exists. An absent file is not an error.
-func mergeFile(cfg *Config, path string) error {
-	if _, err := os.Stat(path); err != nil {
-		return nil
-	}
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
-		return fmt.Errorf("config %s: %w", path, err)
-	}
-	return nil
-}
-
-// normalizeLegacyMCPTiers keeps loaded legacy config files on the new product
-// behavior: enabled MCP servers connect in the background by default, and the
-// retired per-server startup tier is no longer a user-facing setting.
-func normalizeLegacyMCPTiers(c *Config) {
-	if c == nil {
-		return
-	}
-	for i := range c.Plugins {
-		c.Plugins[i].Tier = ""
-	}
-}
-
-func migrateLegacyMCPTiersFile(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	next, changed := stripLegacyMCPTierLines(string(raw))
-	if !changed {
-		return nil
-	}
-	return os.WriteFile(path, []byte(next), info.Mode().Perm())
-}
-
-func stripLegacyMCPTierLines(raw string) (string, bool) {
-	lines := strings.Split(raw, "\n")
-	section := ""
-	changed := false
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if header := tomlSectionHeader(line); header != "" {
-			section = header
-		}
-		if section == "plugins" && isTOMLKeyAssignment(line, "tier") {
-			changed = true
-			continue
-		}
-		out = append(out, line)
-	}
-	return strings.Join(out, "\n"), changed
-}
-
-func tomlSectionHeader(line string) string {
-	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "[") {
-		return ""
-	}
-	if i := strings.Index(trimmed, "#"); i >= 0 {
-		trimmed = strings.TrimSpace(trimmed[:i])
-	}
-	switch trimmed {
-	case "[[plugins]]":
-		return "plugins"
-	default:
-		return "other"
-	}
-}
-
-func isTOMLKeyAssignment(line, key string) bool {
-	trimmed := strings.TrimSpace(line)
-	if strings.HasPrefix(trimmed, "#") || !strings.HasPrefix(trimmed, key) {
-		return false
-	}
-	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, key))
-	return strings.HasPrefix(rest, "=")
-}
-
-// normalizeLegacyProviderModels repairs provider entries written by older
-// desktop builds that carried the official provider name/endpoint but omitted the
-// model field. The repair is intentionally narrow: valid user-provided model
-// lists are left untouched, while known official aliases get the model implied by
-// their preset name so model pickers and provider validation have an option.
-func normalizeLegacyProviderModels(c *Config) {
-	if c == nil {
-		return
-	}
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if providerHasAnyModel(*p) {
-			continue
-		}
-		if model := legacyOfficialProviderModel(p.Name); model != "" {
-			p.Model = model
-		}
-	}
-}
-
-func normalizeOfficialDeepSeekModels(c *Config) {
-	if c == nil {
-		return
-	}
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if officialProviderHost(p.BaseURL) != "api.deepseek.com" {
-			continue
-		}
-		switch strings.TrimSpace(p.Name) {
-		case "deepseek":
-			ensureProviderModels(p, []string{"deepseek-v4-flash", "deepseek-v4-pro"}, "deepseek-v4-flash")
-		case "deepseek-flash":
-			ensureProviderModels(p, []string{"deepseek-v4-flash"}, "deepseek-v4-flash")
-		case "deepseek-pro":
-			ensureProviderModels(p, []string{"deepseek-v4-pro"}, "deepseek-v4-pro")
-		}
-	}
-}
-
-func officialProviderHost(baseURL string) string {
-	u, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil {
-		return ""
-	}
-	return strings.ToLower(u.Hostname())
-}
-
-func ensureProviderModels(p *ProviderEntry, required []string, fallbackDefault string) {
-	if p == nil {
-		return
-	}
-	// If the user has explicitly curated a model list (via Settings), respect
-	// that choice and do not merge additional required models.
-	if len(p.Models) > 0 {
-		return
-	}
-	models := mergeModelLists(required, p.ModelList())
-	if len(models) == 0 {
-		return
-	}
-	p.Model = models[0]
-	if len(models) > 1 {
-		p.Models = models
-		p.Default = firstKnownModel(p.Default, models, fallbackDefault)
-		return
-	}
-	p.Models = nil
-	p.Default = ""
-}
-
-func legacyOfficialProviderModel(name string) string {
-	switch strings.TrimSpace(name) {
-	case "deepseek-flash":
-		return "deepseek-v4-flash"
-	case "deepseek-pro":
-		return "deepseek-v4-pro"
-	case "mimo-api", "mimo-pro":
-		return "mimo-v2.5-pro"
-	case "mimo-flash":
-		return "mimo-v2.5"
-	default:
-		return ""
-	}
-}
-
-func normalizeDesktopOfficialProviderAccess(c *Config) {
-	if c == nil || len(c.Desktop.ProviderAccess) == 0 {
-		return
-	}
-	seen := desktopProviderAccessMap(nil)
-	next := make([]string, 0, len(c.Desktop.ProviderAccess))
-	includeMimoFlash := false
-	for _, name := range c.Desktop.ProviderAccess {
-		if strings.TrimSpace(name) == "mimo-flash" {
-			includeMimoFlash = true
-		}
-		name = desktopProviderAccessNameForConfig(c, name)
-		if name == "" || seen[name] {
-			continue
-		}
-		seen[name] = true
-		next = append(next, name)
-	}
-	c.Desktop.ProviderAccess = next
-	if seen["deepseek"] {
-		ensureDeepSeekOfficialProvider(c)
-	}
-	if seen["mimo-api"] {
-		ensureMimoAPIProvider(c)
-	}
-	if seen["mimo-token-plan"] {
-		ensureMimoTokenPlanProvider(c, includeMimoFlash)
-	}
-	retargetDesktopOfficialRefs(c, seen)
-}
-
-// NormalizeLegacyDesktopProviderAccess seeds the desktop provider-access list
-// for configs written before Settings tracked explicit provider access. Callers
-// should only use this when they know the TOML did not declare provider_access;
-// an explicit empty list means the user removed all access entries.
-func NormalizeLegacyDesktopProviderAccess(c *Config) {
-	if c == nil || len(c.Desktop.ProviderAccess) > 0 {
-		return
-	}
-	seen := desktopProviderAccessMap(nil)
-	var access []string
-	add := func(name string) {
-		name = desktopProviderAccessNameForConfig(c, name)
-		if name == "" || seen[name] {
-			return
-		}
-		seen[name] = true
-		access = append(access, name)
-	}
-	addRef := func(ref string) {
-		if entry, ok := c.ResolveModel(ref); ok {
-			if !entry.Configured() {
-				return
-			}
-			add(entry.Name)
-		}
-	}
-	addRef(c.DefaultModel)
-	addRef(c.Agent.PlannerModel)
-	addRef(c.Agent.SubagentModel)
-	addRef(c.Agent.AutoPlanClassifier)
-	for _, ref := range c.Agent.SubagentModels {
-		addRef(ref)
-	}
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if p.Configured() && len(p.ModelList()) > 0 {
-			add(p.Name)
-		}
-	}
-	if len(access) == 0 {
-		return
-	}
-	c.Desktop.ProviderAccess = access
-	normalizeDesktopOfficialProviderAccess(c)
-}
-
-func canonicalDesktopOfficialProviderName(name string) string {
-	switch strings.TrimSpace(name) {
-	case "deepseek-flash", "deepseek-pro":
-		return "deepseek"
-	case "mimo", "xiaomi-mimo", "xiaomi_mimo":
-		return "mimo-api"
-	case "mimo-pro", "mimo-flash":
-		return "mimo-token-plan"
-	default:
-		return strings.TrimSpace(name)
-	}
-}
-
-func desktopProviderAccessNameForConfig(c *Config, name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return ""
-	}
-	canonical := canonicalDesktopOfficialProviderName(name)
-	if canonical == name {
-		return name
-	}
-	if c == nil {
-		return canonical
-	}
-	if p, ok := c.Provider(name); ok && !providerEntryMatchesCanonicalOfficialAccess(p, canonical) {
-		return name
-	}
-	return canonical
-}
-
-func providerEntryMatchesCanonicalOfficialAccess(p *ProviderEntry, canonical string) bool {
-	if p == nil {
-		return false
-	}
-	switch canonical {
-	case "deepseek":
-		return officialProviderKind(p) == "deepseek"
-	case "mimo-api":
-		return isOfficialMimoAPIProvider(p)
-	case "mimo-token-plan":
-		return isOfficialMimoTokenPlanProvider(p)
-	default:
-		return false
-	}
-}
-
-// CanonicalDesktopOfficialProviderName returns the Settings Center provider ID
-// for built-in official provider aliases.
-func CanonicalDesktopOfficialProviderName(name string) string {
-	return canonicalDesktopOfficialProviderName(name)
-}
-
-func desktopProviderAccessMap(names []string) map[string]bool {
-	out := map[string]bool{}
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			out[name] = true
-		}
-	}
-	return out
-}
-
-func ensureDeepSeekOfficialProvider(c *Config) {
-	if _, ok := c.Provider("deepseek"); ok {
-		return
-	}
-	entry := ProviderEntry{
-		Name:          "deepseek",
-		Kind:          "openai",
-		BaseURL:       "https://api.deepseek.com",
-		Models:        []string{"deepseek-v4-flash", "deepseek-v4-pro"},
-		Default:       "deepseek-v4-flash",
-		APIKeyEnv:     "DEEPSEEK_API_KEY",
-		BalanceURL:    "https://api.deepseek.com/user/balance",
-		ContextWindow: 1_000_000,
-		Prices:        deepSeekV4PricesForConfig(c),
-	}
-	if old, ok := c.Provider("deepseek-flash"); ok {
-		entry = officialProviderFromLegacy(entry, old)
-		entry.Prices = deepSeekV4PricesForConfig(c)
-		entry.Models = mergeModelLists([]string{"deepseek-v4-flash", "deepseek-v4-pro"}, old.ModelList())
-		entry.Default = firstKnownModel(entry.Default, entry.Models, "deepseek-v4-flash")
-	}
-	c.Providers = append(c.Providers, entry)
-}
-
-func ensureMimoAPIProvider(c *Config) {
-	models := []string{"mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-omni"}
-	visionModels := []string{"mimo-v2.5", "mimo-v2-omni"}
-	if p, ok := c.Provider("mimo-api"); ok {
-		if isOfficialMimoAPIProvider(p) {
-			mergeCuratedModelsIntoProvider(p, models, "mimo-v2.5-pro")
-			mergeVisionModelsIntoProvider(p, visionModels)
-			backfillMimoDomesticPrices(p)
-		}
-		return
-	}
-	c.Providers = append(c.Providers, ProviderEntry{
-		Name:          "mimo-api",
-		Kind:          "openai",
-		BaseURL:       "https://api.xiaomimimo.com/v1",
-		Models:        models,
-		VisionModels:  visionModels,
-		Default:       "mimo-v2.5-pro",
-		APIKeyEnv:     "MIMO_API_KEY",
-		ContextWindow: 1_048_576,
-		Prices:        mimoDomesticPrices(models),
-		NoProxy:       true,
-	})
-}
-
-func ensureMimoTokenPlanProvider(c *Config, includeMimoFlash bool) {
-	models := []string{"mimo-v2.5-pro", "mimo-v2.5"}
-	visionModels := []string{"mimo-v2.5"}
-	if p, ok := c.Provider("mimo-token-plan"); ok {
-		if isOfficialMimoTokenPlanProvider(p) {
-			mergeCuratedModelsIntoProvider(p, models, "mimo-v2.5-pro")
-			mergeVisionModelsIntoProvider(p, visionModels)
-			clearMixedMimoTokenPlanPrice(p)
-			backfillMimoDomesticPrices(p)
-		}
-		return
-	}
-	entry := ProviderEntry{
-		Name:          "mimo-token-plan",
-		Kind:          "openai",
-		BaseURL:       "https://token-plan-cn.xiaomimimo.com/v1",
-		Models:        models,
-		VisionModels:  visionModels,
-		Default:       "mimo-v2.5-pro",
-		APIKeyEnv:     "MIMO_API_KEY",
-		ContextWindow: 1_048_576,
-		Prices:        mimoDomesticPrices(models),
-		NoProxy:       true,
-	}
-	if old, ok := c.Provider("mimo-pro"); ok {
-		entry = officialProviderFromLegacy(entry, old)
-		entry.Models = mergeModelLists(models, old.ModelList())
-		entry.Default = firstKnownModel(entry.Default, entry.Models, "mimo-v2.5-pro")
-	}
-	if old, ok := c.Provider("mimo-flash"); includeMimoFlash && ok {
-		if !providerHasAnyModel(entry) {
-			entry = officialProviderFromLegacy(entry, old)
-		}
-		entry.Models = mergeModelLists(entry.Models, old.ModelList())
-		entry.Default = firstKnownModel(entry.Default, entry.Models, entry.Default)
-	}
-	clearMixedMimoTokenPlanPrice(&entry)
-	backfillMimoDomesticPrices(&entry)
-	c.Providers = append(c.Providers, entry)
-}
-
-func isOfficialMimoAPIProvider(e *ProviderEntry) bool {
-	return isOpenAIProviderKind(e) && officialMimoHost(e.BaseURL) == "api.xiaomimimo.com"
-}
-
-func isOfficialMimoTokenPlanProvider(e *ProviderEntry) bool {
-	return isOpenAIProviderKind(e) && officialMimoHost(e.BaseURL) == "token-plan-cn.xiaomimimo.com"
-}
-
-func isOpenAIProviderKind(e *ProviderEntry) bool {
-	return e != nil && strings.EqualFold(strings.TrimSpace(e.Kind), "openai")
-}
-
-func mergeCuratedModelsIntoProvider(e *ProviderEntry, models []string, fallback string) {
-	// If the user has explicitly curated a model list (via Settings), respect
-	// that choice and do not merge additional curated models.
-	if len(e.Models) > 0 {
-		return
-	}
-	currentDefault := e.Default
-	if strings.TrimSpace(currentDefault) == "" {
-		currentDefault = e.Model
-	}
-	e.Models = mergeModelLists(models, e.ModelList())
-	e.Default = firstKnownModel(currentDefault, e.Models, fallback)
-}
-
-func mergeVisionModelsIntoProvider(e *ProviderEntry, models []string) {
-	if e == nil {
-		return
-	}
-	enabled := map[string]bool{}
-	for _, model := range e.ChatModelList() {
-		enabled[model] = true
-	}
-	merged := e.VisionModels
-	if merged == nil {
-		merged = models
-	}
-	out := make([]string, 0, len(merged))
-	for _, model := range merged {
-		if enabled[model] && IsLikelyChatModel(model) {
-			out = append(out, model)
-		}
-	}
-	e.VisionModels = out
-}
-
-func clearMixedMimoTokenPlanPrice(e *ProviderEntry) {
-	if e != nil && e.HasModel("mimo-v2.5-pro") && e.HasModel("mimo-v2.5") {
-		e.Price = nil
-	}
-}
-
-func officialProviderFromLegacy(entry ProviderEntry, old *ProviderEntry) ProviderEntry {
-	entry.Kind = old.Kind
-	entry.BaseURL = old.BaseURL
-	entry.ModelsURL = old.ModelsURL
-	entry.APIKeyEnv = old.APIKeyEnv
-	entry.BalanceURL = old.BalanceURL
-	entry.ContextWindow = old.ContextWindow
-	entry.Price = old.Price
-	entry.Thinking = old.Thinking
-	entry.Effort = old.Effort
-	entry.ReasoningProtocol = old.ReasoningProtocol
-	entry.SupportedEfforts = append([]string(nil), old.SupportedEfforts...)
-	entry.DefaultEffort = old.DefaultEffort
-	entry.NoProxy = old.NoProxy
-	return entry
-}
-
-func mergeModelLists(primary, extra []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(primary)+len(extra))
-	for _, list := range [][]string{primary, extra} {
-		for _, model := range list {
-			model = strings.TrimSpace(model)
-			if model == "" || seen[model] {
-				continue
-			}
-			seen[model] = true
-			out = append(out, model)
-		}
-	}
-	return out
-}
-
-func firstKnownModel(current string, models []string, fallback string) string {
-	current = strings.TrimSpace(current)
-	for _, model := range models {
-		if model == current {
-			return current
-		}
-	}
-	for _, model := range models {
-		if model == fallback {
-			return fallback
-		}
-	}
-	if len(models) > 0 {
-		return models[0]
-	}
-	return ""
-}
-
-func retargetDesktopOfficialRefs(c *Config, access map[string]bool) {
-	c.DefaultModel = retargetDesktopOfficialRef(c.DefaultModel, access)
-	c.Agent.PlannerModel = retargetDesktopOfficialRef(c.Agent.PlannerModel, access)
-	c.Agent.SubagentModel = retargetDesktopOfficialRef(c.Agent.SubagentModel, access)
-	c.Agent.AutoPlanClassifier = retargetDesktopOfficialRef(c.Agent.AutoPlanClassifier, access)
-	for skill, ref := range c.Agent.SubagentModels {
-		c.Agent.SubagentModels[skill] = retargetDesktopOfficialRef(ref, access)
-	}
-}
-
-func retargetDesktopOfficialRef(ref string, access map[string]bool) string {
-	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		return ""
-	}
-	provider, model, hasModel := strings.Cut(ref, "/")
-	switch provider {
-	case "deepseek-flash":
-		if !access["deepseek"] {
-			return ref
-		}
-		if !hasModel || strings.TrimSpace(model) == "" {
-			model = "deepseek-v4-flash"
-		}
-		return "deepseek/" + model
-	case "deepseek-pro":
-		if !access["deepseek"] {
-			return ref
-		}
-		if !hasModel || strings.TrimSpace(model) == "" {
-			model = "deepseek-v4-pro"
-		}
-		return "deepseek/" + model
-	case "mimo-pro":
-		if !access["mimo-token-plan"] {
-			return ref
-		}
-		if !hasModel || strings.TrimSpace(model) == "" {
-			model = "mimo-v2.5-pro"
-		}
-		return "mimo-token-plan/" + model
-	case "mimo", "xiaomi-mimo", "xiaomi_mimo":
-		if !access["mimo-api"] {
-			return ref
-		}
-		if !hasModel || strings.TrimSpace(model) == "" {
-			model = "mimo-v2.5-pro"
-		}
-		return "mimo-api/" + model
-	case "mimo-flash":
-		if !access["mimo-token-plan"] {
-			return ref
-		}
-		if !hasModel || strings.TrimSpace(model) == "" {
-			model = "mimo-v2.5"
-		}
-		return "mimo-token-plan/" + model
-	default:
-		return ref
-	}
-}
-
-func userConfigPath() string {
-	dir := userConfigDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "config.toml")
-}
-
-func userConfigDir() string {
-	return reasonixHomeDir()
-}
-
-func reasonixHomeDir() string {
-	if dir := cleanEnvDir("REASONIX_HOME"); dir != "" {
-		return dir
-	}
-	if runtime.GOOS != "windows" {
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			return filepath.Join(home, ".reasonix")
-		}
-		return ""
-	}
-	dir := osUserConfigDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "reasonix")
-}
-
-func userConfigLoadPath() string {
-	primary := userConfigPath()
-	if primary == "" {
-		return legacyUserConfigPath()
-	}
-	if _, err := os.Stat(primary); err == nil {
-		return primary
-	}
-	if legacy := legacyUserConfigPath(); legacy != "" {
-		if _, err := os.Stat(legacy); err == nil {
-			return legacy
-		}
-	}
-	for _, legacy := range legacyXDGConfigPaths() {
-		if legacy == "" || samePath(legacy, primary) {
-			continue
-		}
-		if _, err := os.Stat(legacy); err == nil {
-			return legacy
-		}
-	}
-	return primary
-}
-
-func legacyUserConfigPath() string {
-	dir := legacyOSSupportDir()
-	if dir == "" {
-		return ""
-	}
-	path := filepath.Join(dir, "config.toml")
-	if primary := userConfigPath(); primary != "" && samePath(path, primary) {
-		return ""
-	}
-	return path
-}
-
-func userConfigCandidatePaths() []string {
-	var paths []string
-	if p := userConfigPath(); p != "" {
-		paths = append(paths, p)
-	}
-	if p := legacyUserConfigPath(); p != "" {
-		paths = append(paths, p)
-	}
-	paths = append(paths, legacyXDGConfigPaths()...)
-	return paths
-}
-
-func legacyXDGConfigPaths() []string {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	seen := map[string]bool{}
-	var paths []string
-	add := func(path string) {
-		if path == "" {
-			return
-		}
-		path = filepath.Clean(path)
-		if seen[path] {
-			return
-		}
-		seen[path] = true
-		paths = append(paths, path)
-	}
-	if dir := cleanEnvDir("XDG_CONFIG_HOME"); dir != "" {
-		add(filepath.Join(dir, "reasonix", "config.toml"))
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		add(filepath.Join(home, ".config", "reasonix", "config.toml"))
-	}
-	return paths
-}
-
-func userSupportDir() string {
-	if dir := cleanEnvDir("REASONIX_STATE_HOME"); dir != "" {
-		return dir
-	}
-	return reasonixHomeDir()
-}
-
-func legacyOSSupportDir() string {
-	dir := osUserConfigDir()
-	if dir == "" {
-		return ""
-	}
-	path := filepath.Join(dir, "reasonix")
-	if current := reasonixHomeDir(); current != "" && samePath(path, current) {
-		return ""
-	}
-	return path
-}
-
-func userCacheDir() string {
-	if dir := cleanEnvDir("REASONIX_CACHE_HOME"); dir != "" {
-		return dir
-	}
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "reasonix")
-}
-
-func osUserConfigDir() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
-	}
-	return dir
-}
-
-func cleanEnvDir(name string) string {
-	dir := strings.TrimSpace(os.Getenv(name))
-	if dir == "" {
-		return ""
-	}
-	dir = ExpandVars(dir)
-	if dir == "~" {
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			dir = home
-		}
-	} else if strings.HasPrefix(dir, "~/") || strings.HasPrefix(dir, `~\`) {
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			dir = filepath.Join(home, dir[2:])
-		}
-	}
-	if !filepath.IsAbs(dir) {
-		if abs, err := filepath.Abs(dir); err == nil {
-			dir = abs
-		}
-	}
-	return filepath.Clean(dir)
-}
-
-func samePath(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	aa, aerr := filepath.Abs(a)
-	bb, berr := filepath.Abs(b)
-	if aerr == nil {
-		a = aa
-	}
-	if berr == nil {
-		b = bb
-	}
-	return filepath.Clean(a) == filepath.Clean(b)
-}
-
-// userConfigDisplayPath is userConfigPath collapsed to a ~-relative form for
-// comments rendered into the user's own config.toml, so Windows users see the
-// real location instead of a hardcoded ~/.reasonix path.
-func userConfigDisplayPath() string {
-	p := userConfigPath()
-	if p == "" {
-		return "<os-config-dir>/reasonix/config.toml"
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		if rel, err := filepath.Rel(home, p); err == nil && !strings.HasPrefix(rel, "..") {
-			return "~/" + filepath.ToSlash(rel)
-		}
-	}
-	return p
-}
-
-// UserConfigPath is the user-global config.toml. It lives under Reasonix home:
-// REASONIX_HOME/config.toml, then ~/.reasonix/config.toml on Unix-like systems,
-// or %AppData%/reasonix/config.toml on Windows. "" when the user config dir
-// can't be resolved.
-func UserConfigPath() string { return userConfigPath() }
-
-// LegacyUserConfigPath is the old OS app-support config.toml path when it
-// differs from UserConfigPath. It is read as a compatibility fallback when the
-// primary user config does not exist.
-func LegacyUserConfigPath() string { return legacyUserConfigPath() }
-
-// LegacyUserConfigPaths returns every known legacy user config path that differs
-// from the current v1.8.1 Reasonix-home config path.
-func LegacyUserConfigPaths() []string {
-	primary := userConfigPath()
-	var out []string
-	add := func(path string) {
-		if path == "" || samePath(path, primary) {
-			return
-		}
-		for _, existing := range out {
-			if samePath(existing, path) {
-				return
-			}
-		}
-		out = append(out, path)
-	}
-	add(legacyUserConfigPath())
-	for _, path := range legacyXDGConfigPaths() {
-		add(path)
-	}
-	return out
-}
-
-// ReasonixHomeDir is the current Reasonix home directory. It honors
-// REASONIX_HOME, then uses ~/.reasonix on macOS/Linux or %APPDATA%/reasonix on
-// Windows.
-func ReasonixHomeDir() string { return reasonixHomeDir() }
-
-// UserCredentialsPath is the reasonix-owned global secrets file under Reasonix
-// home. It holds KEY=value lines loaded into the environment by loadDotEnv. The
-// setup wizard writes API keys here, deliberately NOT named .env: keys never
-// land in a project's own .env (which can't be selectively gitignored), never
-// get committed, and resolve from any working directory. "" when Reasonix home
-// can't be resolved.
-func UserCredentialsPath() string {
-	dir := userSupportDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "credentials")
-}
-
-// ArchiveDir is where compacted conversation history is archived for
-// traceability (one timestamped .jsonl per compaction). Empty if the user state
-// directory cannot be resolved, in which case archiving is skipped.
-func ArchiveDir() string {
-	dir := userSupportDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "archive")
-}
-
-// SessionDir is where chat sessions are persisted (one .jsonl per session).
-// Used by `reasonix --continue` / `--resume` to find the recent ones. Empty
-// if the user state dir can't be resolved — sessions then aren't saved.
-func SessionDir() string {
-	dir := userSupportDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "sessions")
-}
-
-// ProjectSessionDir is the per-workspace session directory the desktop sidebar
-// lists: <state root>/projects/<slug>/sessions. Empty when either the state root
-// or workspaceRoot doesn't resolve.
-func ProjectSessionDir(workspaceRoot string) string {
-	base := MemoryUserDir()
-	root := strings.TrimSpace(workspaceRoot)
-	if base == "" || root == "" {
-		return ""
-	}
-	if abs, err := filepath.Abs(root); err == nil {
-		root = abs
-	}
-	return filepath.Join(base, "projects", WorkspaceSlug(root), "sessions")
-}
-
-// WorkspaceSlug flattens an absolute workspace path into the directory name
-// used under <config root>/projects.
-func WorkspaceSlug(absPath string) string {
-	return strings.NewReplacer(string(os.PathSeparator), "-", "/", "-", "\\", "-", ":", "-").Replace(absPath)
-}
-
-// CacheDir is the per-user cache root for derived/regenerable artefacts: MCP
-// handshake snapshots, plugin startup-latency telemetry. Empty when the OS dir is
-// unavailable — callers must tolerate that (caching is best-effort).
-func CacheDir() string {
-	dir := userCacheDir()
-	if dir == "" {
-		return ""
-	}
-	return dir
-}
-
-// MemoryUserDir returns the reasonix user state root (…/reasonix), under which
-// the user-global REASONIX.md and the per-project auto-memory store live. Empty
-// when the user state dir can't be resolved, which disables user-scoped memory.
-func MemoryUserDir() string {
-	return userSupportDir()
-}
-
-// ConventionDirs are the parent directories scanned for agent assets (skills,
-// commands), in canonical-first order. .reasonix is ours; .agents / .agent /
-// .claude let users drop in assets authored for other agent tools without moving
-// files. Shared so skills (internal/skill) and commands (CommandDirs) discover
-// the same set. Note: hooks are NOT scanned across these — a .claude/settings.json
-// uses a different hook schema that can't be parsed as ours, so hooks stay in
-// .reasonix/settings.json (see internal/hook).
-var ConventionDirs = []string{".reasonix", ".agents", ".agent", ".claude"}
-
-// conventionSubdirsAsc joins sub under each ConventionDir of base, in ascending
-// priority (reverse of ConventionDirs) so the canonical .reasonix ends up the
-// highest-priority entry — command.Load lets a later directory win on a clash.
-func conventionSubdirsAsc(base, sub string) []string {
-	out := make([]string, 0, len(ConventionDirs))
-	for i := len(ConventionDirs) - 1; i >= 0; i-- {
-		out = append(out, filepath.Join(base, ConventionDirs[i], sub))
-	}
-	return out
-}
-
-// CommandDirs returns the directories scanned for custom slash commands, lowest
-// priority first, so a later (more specific) directory overrides an earlier one
-// on a name clash. Order: home-dir convention dirs (~/.claude/commands …
-// ~/.reasonix/commands), the Reasonix home commands dir, the legacy OS
-// app-support dir if different, then the project's
-// convention dirs (.claude/commands … .reasonix/commands). Scanning the .claude /
-// .agents / .agent dirs lets commands authored for other agent tools (same .md +
-// frontmatter format) work here unchanged.
-func CommandDirs() []string {
-	return CommandDirsForRoot(".")
-}
-
-// CommandDirsForRoot is like CommandDirs but resolves the project convention
-// dirs under root instead of the current working directory. Global dirs are
-// unchanged — they are always user-scoped.
-func CommandDirsForRoot(root string) []string {
-	root = resolveRoot(root)
-	var dirs []string
-	add := func(dir string) {
-		if dir == "" {
-			return
-		}
-		for _, existing := range dirs {
-			if samePath(existing, dir) {
-				return
-			}
-		}
-		dirs = append(dirs, dir)
-	}
-	if dir := legacyOSSupportDir(); dir != "" {
-		add(filepath.Join(dir, "commands"))
-	}
-	for _, legacy := range legacyXDGConfigPaths() {
-		add(filepath.Join(filepath.Dir(legacy), "commands"))
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		for _, dir := range conventionSubdirsAsc(home, "commands") {
-			add(dir)
-		}
-	}
-	if dir := userConfigDir(); dir != "" {
-		add(filepath.Join(dir, "commands"))
-	}
-	if dir := userSupportDir(); dir != "" && !samePath(dir, userConfigDir()) {
-		add(filepath.Join(dir, "commands"))
-	}
-	for _, dir := range conventionSubdirsAsc(root, "commands") {
-		add(dir)
-	}
-	return dirs
-}
-
-// SourcePath returns the highest-priority config file that exists, or "" if none.
-func SourcePath() string {
-	return SourcePathForRoot(".")
-}
-
-// SourcePathForRoot returns the highest-priority config file that exists under
-// root, or "" if none. Equivalent to SourcePath() when root is ".".
-func SourcePathForRoot(root string) string {
-	root = resolveRoot(root)
-	projectTOML := "reasonix.toml"
-	if root != "." {
-		projectTOML = filepath.Join(root, "reasonix.toml")
-	}
-	if _, err := os.Stat(projectTOML); err == nil {
-		return projectTOML
-	}
-	if uc := userConfigLoadPath(); uc != "" {
-		if _, err := os.Stat(uc); err == nil {
-			return uc
-		}
-	}
-	return ""
-}
-
-// WriteFile writes the configuration to path as annotated TOML.
+// WriteFile writes the configuration to path as annotated TOML. The write is
+// atomic + fsynced so an interrupted write or power loss can never truncate the
+// main config into an unparseable state that leaves the app with no usable
+// models (#4615, #4708).
 func (c *Config) WriteFile(path string) error {
-	return os.WriteFile(path, []byte(RenderTOMLForScope(c, renderScopeForPath(path))), 0o644)
+	return fileutil.AtomicWriteFile(path, []byte(RenderTOMLForScope(c, renderScopeForPath(path))), configFilePerm(path))
 }
 
 // Provider returns the named provider entry.
@@ -2803,6 +1485,7 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 			cp := *e
 			cp.Model = model
 			cp.applyModelPrice()
+			cp.applyModelOverride()
 			return &cp, true
 		}
 	}
@@ -2811,6 +1494,7 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 		cp := *e
 		cp.Model = e.DefaultModel()
 		cp.applyModelPrice()
+		cp.applyModelOverride()
 		return &cp, true
 	}
 	// a bare model name → the provider that lists it
@@ -2819,6 +1503,7 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 			cp := c.Providers[i]
 			cp.Model = ref
 			cp.applyModelPrice()
+			cp.applyModelOverride()
 			return &cp, true
 		}
 	}
@@ -2860,10 +1545,50 @@ func (c *Config) ResolveModelWithFallback(ref string) (resolvedRef string, fallb
 
 // APIKey resolves the entry's API key from its api_key_env.
 func (e *ProviderEntry) APIKey() string {
+	if e == nil {
+		return ""
+	}
+	if e.resolvedAPIKey != "" {
+		return e.resolvedAPIKey
+	}
 	if e.APIKeyEnv == "" {
 		return ""
 	}
-	return os.Getenv(e.APIKeyEnv)
+	value, _, ok := storedCredentialValue(e.APIKeyEnv)
+	if !ok {
+		return ""
+	}
+	return value
+}
+
+// ResolveAPIKeyFromProcessEnvForProbe pins a setup-time, user-entered key onto
+// this entry for an immediate connectivity probe. Normal runtime resolution does
+// not call this; loaded provider entries still resolve only from Reasonix's
+// global .env.
+func (e *ProviderEntry) ResolveAPIKeyFromProcessEnvForProbe() {
+	if e == nil {
+		return
+	}
+	key := strings.TrimSpace(e.APIKeyEnv)
+	if key == "" {
+		return
+	}
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return
+	}
+	e.resolvedAPIKey = value
+	e.resolvedSource = CredentialSource{Kind: CredentialSourceEnvironment, Label: "setup prompt"}
+}
+
+func (e *ProviderEntry) APIKeySourceLabel() string {
+	if e == nil || strings.TrimSpace(e.APIKeyEnv) == "" {
+		return ""
+	}
+	if e.resolvedAPIKey != "" {
+		return credentialSourceLabel(e.resolvedSource)
+	}
+	return ResolveCredentialForRootGlobalFirst(".", e.APIKeyEnv).Source.Label
 }
 
 // RequiresAPIKey reports whether this provider should be hidden/validated when

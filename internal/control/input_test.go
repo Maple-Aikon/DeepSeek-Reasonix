@@ -31,17 +31,28 @@ func (f *fakeAutoPlanClassifier) NeedsPlan(ctx context.Context, input string, sc
 }
 
 type fakeTurnRunner struct {
-	inputs []string
+	inputs               []string
+	memoryCompilerInputs []string
+	memoryCompilerSkips  []bool
 }
 
 func (f *fakeTurnRunner) Run(ctx context.Context, input string) error {
 	f.inputs = append(f.inputs, input)
+	f.memoryCompilerSkips = append(f.memoryCompilerSkips, agent.MemoryCompilerSkipFromContext(ctx))
+	if source, ok := agent.MemoryCompilerSourceInputFromContext(ctx); ok {
+		f.memoryCompilerInputs = append(f.memoryCompilerInputs, source)
+	}
 	return nil
 }
 
 type fakeLanguageRunner struct {
 	fakeTurnRunner
-	lang string
+	responseLang string
+	lang         string
+}
+
+func (f *fakeLanguageRunner) SetResponseLanguage(lang string) {
+	f.responseLang = lang
 }
 
 func (f *fakeLanguageRunner) SetReasoningLanguage(lang string) {
@@ -110,6 +121,24 @@ func TestComposePlanModeMarker(t *testing.T) {
 	}
 }
 
+func TestPlanModeMarkerMatchesPolicy(t *testing.T) {
+	for _, want := range []string{"research", "ask", "todo_write", "read_only_task", "read_only_skill"} {
+		if !strings.Contains(PlanModeMarker, want) {
+			t.Fatalf("PlanModeMarker should describe %q as available:\n%s", want, PlanModeMarker)
+		}
+	}
+	for _, forbidden := range []string{"task", "complete_step"} {
+		if strings.Contains(PlanModeMarker, forbidden+" are available") || strings.Contains(PlanModeMarker, forbidden+",") {
+			t.Fatalf("PlanModeMarker must not list blocked tool %q as available:\n%s", forbidden, PlanModeMarker)
+		}
+	}
+	for _, blocked := range []string{"write files", "unsafe shell commands", "install capabilities", "mutate memory", "delegate", "mark execution steps complete"} {
+		if !strings.Contains(PlanModeMarker, blocked) {
+			t.Fatalf("PlanModeMarker should mention blocked capability %q:\n%s", blocked, PlanModeMarker)
+		}
+	}
+}
+
 func TestComposeReasoningLanguagePreference(t *testing.T) {
 	auto := New(Options{ReasoningLanguage: "auto"})
 	if got := auto.Compose("hi"); got != "hi" {
@@ -123,6 +152,22 @@ func TestComposeReasoningLanguagePreference(t *testing.T) {
 	}
 	if stripped := StripComposePrefixes(got); stripped != "hi" {
 		t.Fatalf("StripComposePrefixes = %q, want hi", stripped)
+	}
+}
+
+func TestRunComposesResponseLanguagePreference(t *testing.T) {
+	runner := &fakeTurnRunner{}
+	c := New(Options{ResponseLanguage: "en", Runner: runner})
+
+	if err := c.Run(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.inputs) != 1 {
+		t.Fatalf("runner inputs = %d, want 1", len(runner.inputs))
+	}
+	got := runner.inputs[0]
+	if !strings.HasPrefix(got, "<response-language>") || !strings.Contains(got, "use English") || !strings.HasSuffix(got, "hi") {
+		t.Fatalf("headless Run should compose the response language preference, got %q", got)
 	}
 }
 
@@ -142,6 +187,21 @@ func TestRunComposesReasoningLanguagePreference(t *testing.T) {
 	}
 }
 
+func TestSetResponseLanguageUpdatesRunner(t *testing.T) {
+	runner := &fakeLanguageRunner{}
+	c := New(Options{Runner: runner})
+
+	c.SetResponseLanguage("en")
+	if runner.responseLang != "en" {
+		t.Fatalf("runner response language = %q, want en", runner.responseLang)
+	}
+
+	c.SetResponseLanguage("auto")
+	if runner.responseLang != "auto" {
+		t.Fatalf("runner response language = %q, want auto", runner.responseLang)
+	}
+}
+
 func TestSetReasoningLanguageUpdatesRunner(t *testing.T) {
 	runner := &fakeLanguageRunner{}
 	c := New(Options{Runner: runner})
@@ -154,6 +214,18 @@ func TestSetReasoningLanguageUpdatesRunner(t *testing.T) {
 	c.SetReasoningLanguage("auto")
 	if runner.lang != "auto" {
 		t.Fatalf("runner reasoning language = %q, want auto", runner.lang)
+	}
+}
+
+func TestComposeSyntheticResponseLanguagePreference(t *testing.T) {
+	c := New(Options{ResponseLanguage: "en"})
+
+	got := c.ComposeSynthetic(planApprovedMessage)
+	if !strings.HasPrefix(got, "<response-language>") || !strings.Contains(got, "use English") || !strings.HasSuffix(got, planApprovedMessage) {
+		t.Fatalf("ComposeSynthetic should prefix response language, got %q", got)
+	}
+	if !IsSyntheticUserMessage(got) {
+		t.Fatalf("response-language-prefixed plan approval should still be synthetic")
 	}
 }
 
@@ -190,6 +262,97 @@ func TestComposeIncludesActiveGoal(t *testing.T) {
 	}
 }
 
+func TestGoalAutoResearchTriggersForLongHorizonGoals(t *testing.T) {
+	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	c := New(Options{WorkspaceRoot: root})
+	c.SetGoal("持续排查这个线上卡顿直到根因明确，并验证修复")
+
+	got := c.Compose("next step?")
+	for _, want := range []string{
+		"AutoResearch protocol",
+		"<autoresearch-runtime>",
+		"task_id:",
+		"pivot_required:",
+		"stale_count >= 2",
+		"durable strategy for this Goal",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("AutoResearch goal block missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestGoalAutoResearchCanBeForcedOrDisabled(t *testing.T) {
+	c := New(Options{})
+	c.SetGoalWithResearchMode("fix the typo and add a test", GoalResearchOn)
+	if got := c.Compose("start"); !strings.Contains(got, "AutoResearch protocol") {
+		t.Fatalf("forced research goal should include AutoResearch protocol:\n%s", got)
+	}
+
+	c.SetGoalWithResearchMode("持续排查这个线上卡顿直到根因明确", GoalResearchOff)
+	if got := c.Compose("start"); strings.Contains(got, "AutoResearch protocol") {
+		t.Fatalf("simple override should suppress AutoResearch protocol:\n%s", got)
+	}
+}
+
+func TestGoalCommandPreservesResearchModeFlags(t *testing.T) {
+	c := New(Options{})
+	if !c.applyGoalCommand("/goal --research fix the typo", "") {
+		t.Fatal("goal command was not parsed")
+	}
+	if got := c.Compose("start"); !strings.Contains(got, "AutoResearch protocol") {
+		t.Fatalf("/goal --research should force AutoResearch through command dispatch:\n%s", got)
+	}
+
+	c = New(Options{})
+	if !c.applyGoalCommand("/goal --simple 持续排查这个线上卡顿直到根因明确", "") {
+		t.Fatal("goal command was not parsed")
+	}
+	if got := c.Compose("start"); strings.Contains(got, "AutoResearch protocol") {
+		t.Fatalf("/goal --simple should suppress AutoResearch through command dispatch:\n%s", got)
+	}
+}
+
+func TestAutoStartResearchGoalUsesOnlyStrongSignals(t *testing.T) {
+	for _, input := range []string{
+		"持续排查这个线上卡顿直到根因明确，并验证修复",
+		"不要原地打转，把这个方向完整做成方案并验证",
+		"thoroughly implement, test, optimize, and document this feature",
+		"继续 .reasonix/autoresearch/20260618-224530-cache-audit/ 这个任务",
+	} {
+		if !shouldAutoStartResearchGoal(input) {
+			t.Fatalf("shouldAutoStartResearchGoal(%q) = false, want true", input)
+		}
+	}
+
+	for _, input := range []string{
+		"长期来看这个模块怎么优化？",
+		"研究一下这个函数怎么用",
+		"验证一下这个小修复",
+		"/goal 持续排查直到根因明确",
+		"!go test ./...",
+	} {
+		if shouldAutoStartResearchGoal(input) {
+			t.Fatalf("shouldAutoStartResearchGoal(%q) = true, want false", input)
+		}
+	}
+}
+
+func TestParseGoalCommandResearchFlags(t *testing.T) {
+	cmd, ok := ParseGoalCommand("/goal --research fix the typo")
+	if !ok || cmd.Action != GoalCommandSet || cmd.Text != "fix the typo" || cmd.ResearchMode != GoalResearchOn {
+		t.Fatalf("ParseGoalCommand --research = %+v ok=%v", cmd, ok)
+	}
+
+	cmd, ok = ParseGoalCommand("/goal --simple 持续排查直到根因明确")
+	if !ok || cmd.Action != GoalCommandSet || cmd.Text != "持续排查直到根因明确" || cmd.ResearchMode != GoalResearchOff {
+		t.Fatalf("ParseGoalCommand --simple = %+v ok=%v", cmd, ok)
+	}
+}
+
 func TestGoalCommandSetsReportsAndClears(t *testing.T) {
 	var notices []string
 	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
@@ -216,6 +379,61 @@ func TestGoalCommandSetsReportsAndClears(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("notices missing %q: %v", want, notices)
 		}
+	}
+}
+
+func TestParseGoalCommandWithStrict(t *testing.T) {
+	tests := []struct {
+		input  string
+		text   string
+		strict bool
+		ok     bool
+	}{
+		{"/goal --strict implement calculator", "implement calculator", true, true},
+		{"/goal implement calculator", "implement calculator", false, true},
+		{"/goal --strict", "", true, true},        // --strict shows status
+		{"/goal --strict status", "", true, true}, // --strict shows status
+	}
+	for _, tt := range tests {
+		cmd, ok := ParseGoalCommand(tt.input)
+		if ok != tt.ok {
+			t.Errorf("ParseGoalCommand(%q) ok = %v, want %v", tt.input, ok, tt.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if cmd.Text != tt.text {
+			t.Errorf("ParseGoalCommand(%q).Text = %q, want %q", tt.input, cmd.Text, tt.text)
+		}
+		if cmd.Strict != tt.strict {
+			t.Errorf("ParseGoalCommand(%q).Strict = %v, want %v", tt.input, cmd.Strict, tt.strict)
+		}
+	}
+}
+
+func TestParseGoalCommandStrictOnlyConsumesLeadingFlags(t *testing.T) {
+	structuredGoal := "implement parser\n\n  keep  spacing\nliteral --strict stays"
+	cmd, ok := ParseGoalCommand("/goal --strict " + structuredGoal)
+	if !ok {
+		t.Fatal("ParseGoalCommand returned ok=false")
+	}
+	if !cmd.Strict {
+		t.Fatal("leading --strict should enable strict mode")
+	}
+	if cmd.Text != structuredGoal {
+		t.Fatalf("goal text was rewritten:\nwant %q\ngot  %q", structuredGoal, cmd.Text)
+	}
+
+	cmd, ok = ParseGoalCommand("/goal implement parser --strict literally")
+	if !ok {
+		t.Fatal("ParseGoalCommand with literal --strict returned ok=false")
+	}
+	if cmd.Strict {
+		t.Fatal("non-leading --strict should remain part of the goal text")
+	}
+	if want := "implement parser --strict literally"; cmd.Text != want {
+		t.Fatalf("goal text = %q, want %q", cmd.Text, want)
 	}
 }
 
@@ -382,6 +600,30 @@ func TestSubmitUnknownSlashCommandStillReportsNotice(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for unknown-command notice")
+	}
+}
+
+func TestSubmitUserTurnBypassesCommandDispatch(t *testing.T) {
+	runner := &fakeTurnRunner{}
+	events := make(chan event.Event, 4)
+	c := New(Options{
+		AutoPlan: "off",
+		Runner:   runner,
+		Sink: event.FuncSink(func(e event.Event) {
+			events <- e
+		}),
+	})
+
+	for _, input := range []string{"!echo should stay a prompt", "/clear"} {
+		c.SubmitUserTurn(input, input)
+		waitForTurnDone(t, events)
+	}
+
+	if len(runner.inputs) != 2 {
+		t.Fatalf("SubmitUserTurn should start model turns, inputs=%q", runner.inputs)
+	}
+	if runner.inputs[0] != "!echo should stay a prompt" || runner.inputs[1] != "/clear" {
+		t.Fatalf("SubmitUserTurn inputs = %q", runner.inputs)
 	}
 }
 
@@ -600,6 +842,11 @@ func TestStripComposePrefixes(t *testing.T) {
 			want:  "explain this function",
 		},
 		{
+			name:  "legacy plan mode marker stripped",
+			input: legacyPlanModeMarker + "\n\nexplain this function",
+			want:  "explain this function",
+		},
+		{
 			name:  "plan mode marker without trailing newlines",
 			input: PlanModeMarker,
 			want:  "",
@@ -635,6 +882,63 @@ func TestStripComposePrefixes(t *testing.T) {
 			got := StripComposePrefixes(tt.input)
 			if got != tt.want {
 				t.Errorf("StripComposePrefixes() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripReferencedContextPrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "plain user message unchanged",
+			input: "explain this function",
+			want:  "explain this function",
+		},
+		{
+			name:  "file reference stripped",
+			input: "Referenced context:\n\n<file path=\"main.go\">\nfunc main() {}\n</file>\n\nexplain this function",
+			want:  "explain this function",
+		},
+		{
+			name:  "multiple file references stripped",
+			input: "Referenced context:\n\n<file path=\"a.go\">\npackage a\n</file>\n\n<file path=\"b.go\">\npackage b\n</file>\n\ncompare these files",
+			want:  "compare these files",
+		},
+		{
+			name:  "dir reference stripped",
+			input: "Referenced context:\n\n<dir path=\"src\">\nmain.go\nutil.go\n</dir>\n\nlist the files",
+			want:  "list the files",
+		},
+		{
+			name:  "resource reference stripped",
+			input: "Referenced context:\n\n<resource ref=\"@server/res\">\ndata\n</resource>\n\nanalyze this",
+			want:  "analyze this",
+		},
+		{
+			name:  "image reference stripped",
+			input: "Referenced context:\n\n<image path=\"screenshot.png\">\n[image attachment available at @screenshot.png]\n</image>\n\nwhat is in this image",
+			want:  "what is in this image",
+		},
+		{
+			name:  "only reference no user text",
+			input: "Referenced context:\n\n<file path=\"main.go\">\nfunc main() {}\n</file>\n\n",
+			want:  "",
+		},
+		{
+			name:  "empty input",
+			input: "",
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StripReferencedContextPrefix(tt.input)
+			if got != tt.want {
+				t.Errorf("StripReferencedContextPrefix() = %q, want %q", got, tt.want)
 			}
 		})
 	}

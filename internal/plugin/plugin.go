@@ -27,6 +27,11 @@ import (
 // protocolVersion is the MCP revision Reasonix advertises during initialize.
 const protocolVersion = "2024-11-05"
 
+// defaultCallTimeout is the MCP JSON-RPC call deadline applied when neither the
+// caller context nor config provides one. It is intentionally finite so a slow
+// or hung MCP server cannot block an agent turn indefinitely.
+const defaultCallTimeout = 300 * time.Second
+
 // Spec declares an external MCP server. Type selects the transport: "stdio"
 // (default) runs Command/Args/Env as a subprocess; "http" / "streamable-http"
 // and "sse" connect to URL with optional static Headers.
@@ -38,6 +43,16 @@ type Spec struct {
 	Env     map[string]string
 	URL     string
 	Headers map[string]string
+	// DefaultCallTimeout is the global MCP call cap for this server. Zero keeps
+	// Reasonix's built-in defaultCallTimeout.
+	DefaultCallTimeout time.Duration
+	// CallTimeout overrides DefaultCallTimeout for all calls to this server.
+	// Zero falls back to DefaultCallTimeout.
+	CallTimeout time.Duration
+	// ToolTimeouts overrides the per-call deadline for raw MCP tool names.
+	// Keys are server-local tool names as returned by tools/list, not the
+	// model-visible mcp__server__tool names.
+	ToolTimeouts map[string]time.Duration
 	// Dir, when set, is the working directory of a stdio subprocess. Empty means
 	// inherit reasonix's cwd (the default for user-configured plugins). It exists
 	// for cwd-aware servers like CodeGraph, which detect the project from the
@@ -49,9 +64,14 @@ type Spec struct {
 	Stderr io.Writer
 	// ReadOnlyToolNames marks trusted raw MCP tool names as read-only even when
 	// the server omits annotations.readOnlyHint. It is for known compatibility
-	// overrides where the tool semantics are stable; other user-configured
-	// plugins should rely on MCP metadata.
+	// overrides or user-audited plugin config where the tool semantics are
+	// stable; other user-configured plugins should rely on MCP metadata.
 	ReadOnlyToolNames map[string]bool
+	// ReadOnlyModelToolNames marks trusted model-visible MCP tool names
+	// ("mcp__<server>__<tool>") as read-only. This supports user-level
+	// declarations such as agent.plan_mode_allowed_tools without reverse-parsing
+	// normalized MCP tool names back into raw server-local names.
+	ReadOnlyModelToolNames map[string]bool
 	// StripRawPrefix, when non-empty, removes this prefix from each MCP tool's
 	// raw name before namespacing. For example, StripRawPrefix="server_" turns
 	// "server_search" into "search", yielding "mcp__search__search" instead of
@@ -94,6 +114,13 @@ type Host struct {
 	// teardown and keep a Windows workspace directory locked.
 	deferredCancels []context.CancelFunc
 	deferredWG      sync.WaitGroup
+
+	// spawningMu + spawning prevent concurrent spawns of the same server from
+	// multiple callers (e.g. several controller tabs sharing one Host). The
+	// owner publishes its result before closing done so waiters can reuse the
+	// discovered tools without issuing concurrent tools/list calls.
+	spawningMu sync.Mutex
+	spawning   map[string]*spawnAttempt
 
 	// Detached stats/schema-cache writers from Start; off the boot path but
 	// drained by Close so cleanup can't race a still-open cache file.
@@ -481,7 +508,15 @@ type Client struct {
 	// parallel startup can collect them per-client before merging into Host.
 	prompts   []Prompt
 	resources []Resource
+	toolsMu   sync.Mutex
 	tools     []ToolInfo
+
+	// toolAdapters caches the model-visible remote tool adapters produced by
+	// the first successful tools/list call. Shared hosts reuse Client instances
+	// across controllers, so subsequent ToolsFor calls must not re-query slow
+	// MCP servers just to rebuild identical schemas.
+	toolsListed  bool
+	toolAdapters []tool.Tool
 }
 
 func (c *Client) auxiliaryClient(ctx context.Context) (*Client, context.Context, context.CancelFunc, error) {
@@ -496,8 +531,9 @@ func (c *Client) auxiliaryClient(ctx context.Context) (*Client, context.Context,
 
 // ToolInfo is the human-facing metadata returned by MCP tools/list for one tool.
 type ToolInfo struct {
-	Name        string
-	Description string
+	Name         string
+	Description  string
+	ReadOnlyHint bool
 }
 
 // ServerStatus summarises one connected server for the /mcp command.
@@ -527,8 +563,10 @@ func (h *Host) Servers() []ServerStatus {
 			Name:      c.name,
 			Transport: c.transport,
 			Tools:     c.toolCount,
-			ToolList:  append([]ToolInfo(nil), c.tools...),
 		}
+		c.toolsMu.Lock()
+		s.ToolList = append([]ToolInfo(nil), c.tools...)
+		c.toolsMu.Unlock()
 		for _, p := range h.prompts {
 			if p.Server == c.name {
 				s.Prompts++
@@ -550,6 +588,20 @@ func (h *Host) Failures() []Failure {
 	defer h.mu.RUnlock()
 	out := make([]Failure, len(h.failures))
 	copy(out, h.failures)
+	return out
+}
+
+// ConnectingServers returns server names whose startup handshake is currently in
+// flight. It is intentionally status-only: connected clients and failures remain
+// the source of truth for ready/issue states.
+func (h *Host) ConnectingServers() []string {
+	h.spawningMu.Lock()
+	defer h.spawningMu.Unlock()
+	out := make([]string, 0, len(h.spawning))
+	for name := range h.spawning {
+		out = append(out, name)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -619,6 +671,46 @@ func (h *Host) endDeferredSpawn() {
 	h.deferredWG.Done()
 }
 
+// ErrSpawningInFlight is returned by Host.Add when another caller is already
+// spawning the same server on this host. The caller should retry later.
+var ErrSpawningInFlight = errors.New("server spawn already in progress")
+
+type spawnAttempt struct {
+	done  chan struct{}
+	tools []tool.Tool
+	err   error
+}
+
+// beginSpawn atomically claims the sole right to spawn the named server.
+// Returns owner=true if the caller should proceed. When another caller is
+// already spawning the same server, owner=false and done is closed when that
+// spawn finishes.
+func (h *Host) beginSpawn(name string) (*spawnAttempt, bool) {
+	h.spawningMu.Lock()
+	defer h.spawningMu.Unlock()
+	if h.spawning == nil {
+		h.spawning = make(map[string]*spawnAttempt)
+	}
+	if attempt, ok := h.spawning[name]; ok {
+		return attempt, false
+	}
+	attempt := &spawnAttempt{done: make(chan struct{})}
+	h.spawning[name] = attempt
+	return attempt, true
+}
+
+// endSpawn releases the spawn claim for the named server.
+func (h *Host) endSpawn(name string, tools []tool.Tool, err error) {
+	h.spawningMu.Lock()
+	if attempt, ok := h.spawning[name]; ok {
+		attempt.tools = append([]tool.Tool(nil), tools...)
+		attempt.err = err
+		delete(h.spawning, name)
+		close(attempt.done)
+	}
+	h.spawningMu.Unlock()
+}
+
 // has reports whether a server with this name is already connected.
 func (h *Host) has(name string) bool {
 	h.mu.RLock()
@@ -635,6 +727,43 @@ func (h *Host) hasLocked(name string) bool {
 	return false
 }
 
+// HasClient reports whether a server with this name is already connected to the host.
+func (h *Host) HasClient(name string) bool { return h.has(name) }
+
+// ToolsFor returns the namespaced tool instances for an already-connected client.
+// ctx bounds the tools/list call so a non-responsive server does not hang
+// permanently. An error is returned when no client with that name is connected.
+func (h *Host) ToolsFor(ctx context.Context, name string) ([]tool.Tool, error) {
+	h.mu.RLock()
+	closed := h.closed
+	h.mu.RUnlock()
+	if closed {
+		return nil, fmt.Errorf("plugin host is closed")
+	}
+
+	// Attempt to resolve via the existing Client.
+	c := h.client(name)
+	if c == nil {
+		return nil, fmt.Errorf("client %q not found on shared host", name)
+	}
+	if tools, ok := c.cachedTools(); ok {
+		return tools, nil
+	}
+	return c.listTools(ctx)
+}
+
+// client returns the named connected client, or nil.
+func (h *Host) client(name string) *Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, c := range h.clients {
+		if c.name == name {
+			return c
+		}
+	}
+	return nil
+}
+
 // Add connects one server live: it performs the MCP handshake, discovers the
 // server's tools (and prompts/resources when advertised), appends it to the
 // host, and returns its namespaced tools for the caller to register. ctx bounds a
@@ -644,10 +773,70 @@ func (h *Host) Add(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	if h.has(s.Name) {
 		return nil, serverAlreadyConnectedError(s.Name)
 	}
-	return h.addConnected(ctx, s)
+	attempt, owner := h.beginSpawn(s.Name)
+	if !owner {
+		select {
+		case <-attempt.done:
+			if attempt.err != nil {
+				return nil, attempt.err
+			}
+			return append([]tool.Tool(nil), attempt.tools...), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	var tools []tool.Tool
+	var err error
+	defer func() { h.endSpawn(s.Name, tools, err) }()
+	// Double-check after acquiring the spawn token: another caller may have
+	// connected the server between our h.has check and beginSpawn.
+	if h.has(s.Name) {
+		err = serverAlreadyConnectedError(s.Name)
+		return nil, err
+	}
+	tools, err = h.addConnected(ctx, s)
+	return tools, err
+}
+
+// AddWithLifecycle connects one server live, allowing caller to specify separate
+// contexts for the subprocess lifecycle (lifeCtx, session-scoped) and the startup
+// handshake/list calls (callCtx, turn-scoped/timeout-bound).
+func (h *Host) AddWithLifecycle(lifeCtx, callCtx context.Context, s Spec) ([]tool.Tool, error) {
+	if h.has(s.Name) {
+		return nil, serverAlreadyConnectedError(s.Name)
+	}
+	attempt, owner := h.beginSpawn(s.Name)
+	if !owner {
+		select {
+		case <-attempt.done:
+			if attempt.err != nil {
+				return nil, attempt.err
+			}
+			return append([]tool.Tool(nil), attempt.tools...), nil
+		case <-callCtx.Done():
+			return nil, callCtx.Err()
+		case <-lifeCtx.Done():
+			return nil, lifeCtx.Err()
+		}
+	}
+	var tools []tool.Tool
+	var err error
+	defer func() { h.endSpawn(s.Name, tools, err) }()
+	// Double-check after acquiring the spawn token: another caller may have
+	// connected the server between our h.has check and beginSpawn.
+	if h.has(s.Name) {
+		err = serverAlreadyConnectedError(s.Name)
+		return nil, err
+	}
+	tools, err = h.addConnectedWithLifecycle(lifeCtx, callCtx, s)
+	return tools, err
 }
 
 func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
+	return h.addConnectedWithLifecycle(ctx, ctx, s)
+}
+
+func (h *Host) addConnectedWithLifecycle(lifeCtx, callCtx context.Context, s Spec) ([]tool.Tool, error) {
 	h.mu.RLock()
 	if h.closed {
 		h.mu.RUnlock()
@@ -655,11 +844,11 @@ func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	}
 	h.mu.RUnlock()
 
-	c, err := start(ctx, ctx, s)
+	c, err := start(lifeCtx, callCtx, s)
 	if err != nil {
 		return nil, err
 	}
-	ts, err := c.listTools(ctx)
+	ts, err := c.listTools(callCtx)
 	if err != nil {
 		c.close()
 		return nil, fmt.Errorf("list tools: %w", err)
@@ -679,15 +868,15 @@ func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	h.clients = append(h.clients, c)
 	h.clearFailure(s.Name)
 	h.mu.Unlock()
-	// Prompts and resources stream in on the long ctx the caller passed (Host.Add
+	// Prompts and resources stream in on the long lifeCtx the caller passed (Host.Add
 	// uses the session-scoped PluginCtx, not a per-turn ctx), so the slow list
 	// calls cannot starve a /mcp add of its return value. nil sink keeps hot-add
 	// quiet — the chat UI re-queries Host.Prompts()/Resources() on demand.
 	if c.hasPrompts {
-		go h.fetchPrompts(ctx, c, nil)
+		go h.fetchPrompts(lifeCtx, c, nil)
 	}
 	if c.hasResources {
-		go h.fetchResources(ctx, c, nil)
+		go h.fetchResources(lifeCtx, c, nil)
 	}
 	return ts, nil
 }
@@ -778,7 +967,85 @@ func newTransport(ctx context.Context, s Spec) (transport, error) {
 }
 
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	callCtx, cancel, timeout := c.contextWithCallTimeout(ctx, method, params)
+	if cancel != nil {
+		defer cancel()
+	}
+
+	res, err := c.callTransport(callCtx, method, params)
+	if timeout > 0 && errors.Is(err, context.DeadlineExceeded) && callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		slog.Warn("plugin: MCP call timed out",
+			"server", c.name, "method", method, "tool", rawToolNameFromCallParams(params), "timeout", timeout)
+		return nil, c.timeoutError(method, params, timeout)
+	}
+	return res, err
+}
+
+func (c *Client) callTransport(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	res, err := c.t.call(ctx, method, params)
+	if err == nil || method == "initialize" || !isHTTPSessionExpired(err) {
+		return res, err
+	}
+	if initErr := c.initializeSession(ctx, false); initErr != nil {
+		return nil, fmt.Errorf("%w; reinitialize failed: %v", err, initErr)
+	}
 	return c.t.call(ctx, method, params)
+}
+
+func (c *Client) contextWithCallTimeout(ctx context.Context, method string, params any) (context.Context, context.CancelFunc, time.Duration) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, nil, 0
+	}
+	timeout := c.callTimeout(method, params)
+	if timeout <= 0 {
+		timeout = defaultCallTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	return callCtx, cancel, timeout
+}
+
+func (c *Client) callTimeout(method string, params any) time.Duration {
+	if method == "tools/call" {
+		if raw := rawToolNameFromCallParams(params); raw != "" {
+			if timeout := c.spec.ToolTimeouts[raw]; timeout > 0 {
+				return timeout
+			}
+		}
+	}
+	if c.spec.CallTimeout > 0 {
+		return c.spec.CallTimeout
+	}
+	if c.spec.DefaultCallTimeout > 0 {
+		return c.spec.DefaultCallTimeout
+	}
+	return defaultCallTimeout
+}
+
+func rawToolNameFromCallParams(params any) string {
+	m, ok := params.(map[string]any)
+	if !ok {
+		return ""
+	}
+	name, _ := m["name"].(string)
+	return name
+}
+
+func (c *Client) timeoutError(method string, params any, timeout time.Duration) error {
+	if method == "tools/call" {
+		if raw := rawToolNameFromCallParams(params); raw != "" {
+			return fmt.Errorf("MCP tool %q timed out after %s; increase tool_timeout_seconds or call_timeout_seconds to allow longer runs: %w",
+				c.name+"."+raw, formatTimeout(timeout), context.DeadlineExceeded)
+		}
+	}
+	return fmt.Errorf("MCP method %q on server %q timed out after %s; increase mcp_call_timeout_seconds or call_timeout_seconds to allow longer runs: %w",
+		method, c.name, formatTimeout(timeout), context.DeadlineExceeded)
+}
+
+func formatTimeout(timeout time.Duration) string {
+	if timeout > 0 && timeout%time.Second == 0 {
+		return fmt.Sprintf("%ds", int(timeout/time.Second))
+	}
+	return timeout.String()
 }
 
 func (c *Client) notify(ctx context.Context, method string, params any) error {
@@ -787,7 +1054,16 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 
 func (c *Client) close() { c.t.close() }
 
+func isHTTPSessionExpired(err error) bool {
+	var expired *httpSessionExpiredError
+	return errors.As(err, &expired)
+}
+
 func (c *Client) initialize(ctx context.Context) error {
+	return c.initializeSession(ctx, true)
+}
+
+func (c *Client) initializeSession(ctx context.Context, recordCapabilities bool) error {
 	res, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{},
@@ -795,6 +1071,10 @@ func (c *Client) initialize(ctx context.Context) error {
 	})
 	if err != nil {
 		return err
+	}
+	if !recordCapabilities {
+		// Runtime session refresh must not rewrite startup-only capability flags.
+		return c.notify(ctx, "notifications/initialized", map[string]any{})
 	}
 	// Record which optional capabilities the server advertises. Presence of the
 	// key (even with an empty object) signals support.
@@ -823,11 +1103,21 @@ type mcpTool struct {
 	} `json:"annotations"`
 }
 
-func (s Spec) toolReadOnly(rawName string, hinted bool) bool {
-	return hinted || s.ReadOnlyToolNames[rawName]
+func (s Spec) toolReadOnly(rawName, visibleName string, hinted bool) bool {
+	return hinted || s.toolReadOnlyTrusted(rawName, visibleName)
+}
+
+func (s Spec) toolReadOnlyTrusted(rawName, visibleName string) bool {
+	return s.ReadOnlyToolNames[rawName] || s.ReadOnlyModelToolNames[toolName(s.Name, visibleName)]
 }
 
 func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
+	c.toolsMu.Lock()
+	defer c.toolsMu.Unlock()
+	if c.toolsListed {
+		return append([]tool.Tool(nil), c.toolAdapters...), nil
+	}
+
 	res, err := c.call(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil, err
@@ -847,19 +1137,33 @@ func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
 		if c.spec.StripRawPrefix != "" {
 			visibleName = strings.TrimPrefix(visibleName, c.spec.StripRawPrefix)
 		}
-		toolInfos = append(toolInfos, ToolInfo{Name: t.Name, Description: t.Description})
+		toolInfos = append(toolInfos, ToolInfo{Name: t.Name, Description: t.Description, ReadOnlyHint: hinted})
+		trusted := c.spec.toolReadOnlyTrusted(t.Name, visibleName)
 		tools = append(tools, &remoteTool{
-			client:   c,
-			name:     toolName(c.name, visibleName),
-			rawName:  t.Name,
-			desc:     t.Description,
-			schema:   canonicalizeSchema(t.InputSchema),
-			readOnly: c.spec.toolReadOnly(t.Name, hinted),
+			client:          c,
+			name:            toolName(c.name, visibleName),
+			rawName:         t.Name,
+			desc:            t.Description,
+			schema:          canonicalizeSchema(t.InputSchema),
+			readOnly:        c.spec.toolReadOnly(t.Name, visibleName, hinted),
+			readOnlyTrusted: trusted,
 		})
 	}
 	sort.SliceStable(toolInfos, func(i, j int) bool { return toolInfos[i].Name < toolInfos[j].Name })
+	sortedTools := sortToolsByName(tools)
 	c.tools = toolInfos
-	return sortToolsByName(tools), nil
+	c.toolAdapters = append([]tool.Tool(nil), sortedTools...)
+	c.toolsListed = true
+	return append([]tool.Tool(nil), sortedTools...), nil
+}
+
+func (c *Client) cachedTools() ([]tool.Tool, bool) {
+	c.toolsMu.Lock()
+	defer c.toolsMu.Unlock()
+	if !c.toolsListed {
+		return nil, false
+	}
+	return append([]tool.Tool(nil), c.toolAdapters...), true
 }
 
 // toolName builds the model-visible namespaced name "mcp__<server>__<tool>",
@@ -935,15 +1239,34 @@ type remoteTool struct {
 	desc     string
 	schema   json.RawMessage
 	readOnly bool // from MCP readOnlyHint or trusted first-party Spec override
+	// readOnlyTrusted is true only when readOnly came from a first-party
+	// Spec.ReadOnlyToolNames override, not the server's readOnlyHint. Plan mode
+	// uses it to decide whether to trust ReadOnly() at face value.
+	readOnlyTrusted bool
 }
 
 func (t *remoteTool) Name() string        { return t.name }
 func (t *remoteTool) Description() string { return t.desc }
+func (t *remoteTool) MCPServerName() string {
+	if t.client == nil {
+		return ""
+	}
+	return t.client.name
+}
+func (t *remoteTool) MCPRawToolName() string { return t.rawName }
 
 // ReadOnly reflects MCP readOnlyHint, plus trusted first-party Spec overrides.
 // It defaults to false: opaque third-party tools must declare readOnlyHint
 // before joining reader-default permission handling or plan-mode execution.
 func (t *remoteTool) ReadOnly() bool { return t.readOnly }
+
+// PlanModeUntrustedReadOnly reports true when ReadOnly() is true only because the
+// MCP server self-reported readOnlyHint. A first-party ReadOnlyToolNames override
+// is trusted, so it returns false. Plan mode treats an untrusted read-only tool
+// like a writer unless it is declared in plan_mode_allowed_tools.
+func (t *remoteTool) PlanModeUntrustedReadOnly() bool {
+	return t.readOnly && !t.readOnlyTrusted
+}
 
 func (t *remoteTool) Schema() json.RawMessage {
 	if len(t.schema) == 0 {

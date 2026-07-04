@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
-	"github.com/zalando/go-keyring"
 
 	"reasonix/internal/fileutil"
 )
@@ -21,6 +19,7 @@ const (
 	CredentialsStoreFile    = "file"
 
 	credentialsKeyringService = "reasonix"
+	credentialClearedPrefix   = "# reasonix-cleared "
 )
 
 const (
@@ -54,6 +53,56 @@ var credentialSourceTracker = struct {
 	sync.Mutex
 	byKey map[string]trackedCredentialSource
 }{byKey: map[string]trackedCredentialSource{}}
+
+var storedCredentialValueLookup = storedCredentialValue
+var legacyKeyringCredentialValueLookup = legacyKeyringCredentialValue
+
+// CredentialResolver resolves credentials repeatedly for one caller-owned view
+// build. It keeps expensive global credential-store lookups bounded to one per
+// key while preserving the same source/shadow reporting as the one-shot helpers.
+type CredentialResolver struct {
+	root string
+
+	mu               sync.Mutex
+	globalFirstCache map[string]CredentialResolution
+}
+
+// NewCredentialResolverForRoot returns a resolver scoped to a workspace root.
+func NewCredentialResolverForRoot(root string) *CredentialResolver {
+	return &CredentialResolver{root: resolveRoot(root)}
+}
+
+// ResolveGlobalFirst resolves key from Reasonix's global .env only. Repeated
+// calls for the same key reuse the first result so UI views with multiple
+// provider entries sharing api_key_env stay consistent.
+func (r *CredentialResolver) ResolveGlobalFirst(key string) CredentialResolution {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return CredentialResolution{Name: key}
+	}
+	if r == nil {
+		return resolveCredentialForRootGlobalFirst(".", key)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.globalFirstCache == nil {
+		r.globalFirstCache = map[string]CredentialResolution{}
+	}
+	if cached, ok := r.globalFirstCache[key]; ok {
+		return cloneCredentialResolution(cached)
+	}
+	res := resolveCredentialForRootGlobalFirst(r.root, key)
+	r.globalFirstCache[key] = cloneCredentialResolution(res)
+	return res
+}
+
+func cloneCredentialResolution(res CredentialResolution) CredentialResolution {
+	if len(res.Shadowed) > 0 {
+		res.Shadowed = append([]CredentialSource(nil), res.Shadowed...)
+	}
+	return res
+}
 
 func normalizeCredentialsStore(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -128,50 +177,59 @@ func credentialEnvNamesFromConfig(cfg *Config) []string {
 	return out
 }
 
+func resolveProviderCredentialsForRoot(root string, cfg *Config) {
+	if cfg == nil || len(cfg.Providers) == 0 {
+		return
+	}
+	resolver := NewCredentialResolverForRoot(root)
+	for i := range cfg.Providers {
+		resolveProviderCredentialWithResolver(&cfg.Providers[i], resolver)
+	}
+}
+
+func resolveProviderCredentialWithResolver(entry *ProviderEntry, resolver *CredentialResolver) {
+	if entry == nil {
+		return
+	}
+	key := strings.TrimSpace(entry.APIKeyEnv)
+	if key == "" {
+		entry.resolvedAPIKey = ""
+		entry.resolvedSource = CredentialSource{}
+		return
+	}
+	if resolver == nil {
+		resolver = NewCredentialResolverForRoot(".")
+	}
+	res := resolver.ResolveGlobalFirst(key)
+	if !res.Set || res.Value == "" {
+		entry.resolvedAPIKey = ""
+		entry.resolvedSource = CredentialSource{}
+		return
+	}
+	entry.resolvedAPIKey = res.Value
+	entry.resolvedSource = res.Source
+}
+
+func (e *ProviderEntry) ResolveAPIKeyForRoot(root string) {
+	resolveProviderCredentialWithResolver(e, NewCredentialResolverForRoot(root))
+}
+
 func loadCredentialStoreForRoot(root string) {
 	names := credentialEnvNamesForRoot(root)
 	if len(names) == 0 {
 		return
 	}
-	mode := credentialsStoreMode()
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreKeyring {
-		for _, name := range names {
-			if _, exists := os.LookupEnv(name); exists {
-				recordExistingCredentialSource(name)
-				continue
-			}
-			value, err := keyring.Get(credentialsKeyringService, name)
-			if err == nil && value != "" {
-				_ = os.Setenv(name, value)
-				recordCredentialSource(name, value, CredentialSource{Kind: CredentialSourceCredentials, Label: "system credential store"})
-			}
-		}
-	}
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreFile {
-		if p := UserCredentialsPath(); p != "" {
-			loadDotEnvFileAs(p, CredentialSource{Kind: CredentialSourceCredentials, Path: p, Label: "Reasonix credentials"})
-		}
-		for _, p := range legacyCredentialsPaths() {
-			loadDotEnvFileAs(p, CredentialSource{Kind: CredentialSourceLegacy, Path: p, Label: "legacy Reasonix credentials"})
-		}
+	if p := UserCredentialsPath(); p != "" {
+		loadDotEnvFileAs(p, CredentialSource{Kind: CredentialSourceCredentials, Path: p, Label: "Reasonix credentials (.env)"})
 	}
 }
 
-// StoreCredentialLines stores KEY=value assignments in the configured user
-// credential store and pins them into the current process environment.
+// StoreCredentialLines stores KEY=value assignments in Reasonix's global .env
+// and pins them into the current process environment.
 func StoreCredentialLines(lines []string) (string, error) {
 	assignments := parseCredentialLines(lines)
 	if len(assignments) == 0 {
 		return CredentialsTargetDescription(), nil
-	}
-	mode := credentialsStoreMode()
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreKeyring {
-		if err := storeCredentialsInKeyring(assignments); err == nil {
-			pinCredentialAssignments(assignments)
-			return "system credential store", nil
-		} else if mode == CredentialsStoreKeyring {
-			return "", err
-		}
 	}
 	if err := storeCredentialsInFile(UserCredentialsPath(), assignments); err != nil {
 		return "", err
@@ -193,21 +251,12 @@ func SetCredential(key, value string) (string, error) {
 
 func RemoveCredential(key string) error {
 	key = strings.TrimSpace(key)
-	if key == "" {
+	if key == "" || !isCredentialKey(key) {
 		return nil
 	}
-	mode := credentialsStoreMode()
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreKeyring {
-		err := keyring.Delete(credentialsKeyringService, key)
-		if err != nil && !errors.Is(err, keyring.ErrNotFound) && mode == CredentialsStoreKeyring {
+	if path := UserCredentialsPath(); path != "" {
+		if err := removeCredentialFromFile(path, key); err != nil {
 			return err
-		}
-	}
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreFile {
-		if path := UserCredentialsPath(); path != "" {
-			if err := removeCredentialFromFile(path, key); err != nil {
-				return err
-			}
 		}
 	}
 	return os.Unsetenv(key)
@@ -218,9 +267,6 @@ func CredentialIsSet(key string) bool {
 	if key == "" {
 		return false
 	}
-	if os.Getenv(key) != "" {
-		return true
-	}
 	return CredentialStored(key)
 }
 
@@ -229,20 +275,7 @@ func CredentialStored(key string) bool {
 	if key == "" {
 		return false
 	}
-	mode := credentialsStoreMode()
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreKeyring {
-		if value, err := keyring.Get(credentialsKeyringService, key); err == nil && value != "" {
-			return true
-		}
-	}
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreFile {
-		for _, path := range append([]string{UserCredentialsPath()}, legacyCredentialsPaths()...) {
-			if envFileHasKey(path, key) {
-				return true
-			}
-		}
-	}
-	return false
+	return envFileHasValue(UserCredentialsPath(), key)
 }
 
 func credentialCurrentStoreHasKey(key string) bool {
@@ -250,27 +283,19 @@ func credentialCurrentStoreHasKey(key string) bool {
 	if key == "" {
 		return false
 	}
-	mode := credentialsStoreMode()
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreKeyring {
-		if value, err := keyring.Get(credentialsKeyringService, key); err == nil && value != "" {
-			return true
-		}
+	return envFileHasValue(UserCredentialsPath(), key)
+}
+
+func credentialCurrentStoreClearedKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
 	}
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreFile {
-		return envFileHasKey(UserCredentialsPath(), key)
-	}
-	return false
+	return envFileHasClearedKey(UserCredentialsPath(), key)
 }
 
 func CredentialsTargetDescription() string {
-	switch credentialsStoreMode() {
-	case CredentialsStoreKeyring:
-		return "system credential store"
-	case CredentialsStoreFile:
-		return UserCredentialsPath()
-	default:
-		return "system credential store or " + UserCredentialsPath()
-	}
+	return UserCredentialsPath()
 }
 
 func parseCredentialLines(lines []string) map[string]string {
@@ -294,7 +319,7 @@ func parseCredentialLines(lines []string) map[string]string {
 func pinCredentialAssignments(assignments map[string]string) {
 	for key, value := range assignments {
 		_ = os.Setenv(key, value)
-		recordCredentialSource(key, value, CredentialSource{Kind: CredentialSourceCredentials, Label: "Reasonix credentials"})
+		recordCredentialSource(key, value, CredentialSource{Kind: CredentialSourceCredentials, Path: UserCredentialsPath(), Label: "Reasonix credentials (.env)"})
 	}
 }
 
@@ -389,11 +414,16 @@ func ResolveCredentialForRoot(root, key string) CredentialResolution {
 
 func ResolveCredentialForRootGlobalFirst(root, key string) CredentialResolution {
 	key = strings.TrimSpace(key)
+	return NewCredentialResolverForRoot(root).ResolveGlobalFirst(key)
+}
+
+func resolveCredentialForRootGlobalFirst(root, key string) CredentialResolution {
+	root = resolveRoot(root)
 	res := CredentialResolution{Name: key}
 	if key == "" {
 		return res
 	}
-	if value, source, ok := storedCredentialValue(key); ok {
+	if value, source, ok := storedCredentialValueLookup(key); ok {
 		res.Set = true
 		res.Value = value
 		res.Source = source
@@ -401,54 +431,13 @@ func ResolveCredentialForRootGlobalFirst(root, key string) CredentialResolution 
 		res.Shadowed = shadowedCredentialSources(root, key, value, res.Source)
 		return res
 	}
-	for _, source := range credentialSourceCandidates(root) {
-		switch source.Kind {
-		case CredentialSourceProjectEnv, CredentialSourceHomeEnv, CredentialSourceLegacy:
-		default:
-			continue
-		}
-		if value, ok := envFileValue(source.Path, key); ok && value != "" {
-			res.Set = true
-			res.Value = value
-			source.Label = credentialSourceLabel(source)
-			res.Source = source
-			res.Shadowed = shadowedCredentialSources(root, key, value, source)
-			return res
-		}
-	}
-	value := os.Getenv(key)
-	if value == "" {
-		return res
-	}
-	res.Set = true
-	res.Value = value
-	if source, ok := trackedCredential(key, value); ok {
-		res.Source = source
-	} else {
-		res.Source = CredentialSource{Kind: CredentialSourceEnvironment}
-	}
-	res.Source.Label = credentialSourceLabel(res.Source)
-	res.Shadowed = shadowedCredentialSources(root, key, value, res.Source)
 	return res
 }
 
 func storedCredentialValue(key string) (string, CredentialSource, bool) {
-	mode := credentialsStoreMode()
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreKeyring {
-		if value, err := keyring.Get(credentialsKeyringService, key); err == nil && value != "" {
-			return value, CredentialSource{Kind: CredentialSourceCredentials, Label: "system credential store"}, true
-		}
-	}
-	if mode == CredentialsStoreAuto || mode == CredentialsStoreFile {
-		if p := UserCredentialsPath(); p != "" {
-			if value, ok := envFileValue(p, key); ok && value != "" {
-				return value, CredentialSource{Kind: CredentialSourceCredentials, Path: p, Label: "Reasonix credentials"}, true
-			}
-		}
-		for _, p := range legacyCredentialsPaths() {
-			if value, ok := envFileValue(p, key); ok && value != "" {
-				return value, CredentialSource{Kind: CredentialSourceLegacy, Path: p, Label: "legacy Reasonix credentials"}, true
-			}
+	if p := UserCredentialsPath(); p != "" {
+		if value, ok := envFileValue(p, key); ok && value != "" {
+			return value, CredentialSource{Kind: CredentialSourceCredentials, Path: p, Label: "Reasonix credentials (.env)"}, true
 		}
 	}
 	return "", CredentialSource{}, false
@@ -489,9 +478,6 @@ func credentialSourceCandidates(root string) []CredentialSource {
 	if p := UserCredentialsPath(); p != "" {
 		out = append(out, CredentialSource{Kind: CredentialSourceCredentials, Path: p})
 	}
-	for _, p := range legacyCredentialsPaths() {
-		out = append(out, CredentialSource{Kind: CredentialSourceLegacy, Path: p})
-	}
 	if home, err := os.UserHomeDir(); err == nil {
 		out = append(out, CredentialSource{Kind: CredentialSourceHomeEnv, Path: filepath.Join(home, ".env")})
 	}
@@ -508,15 +494,6 @@ func sameCredentialSource(a, b CredentialSource) bool {
 	return samePath(a.Path, b.Path)
 }
 
-func storeCredentialsInKeyring(assignments map[string]string) error {
-	for key, value := range assignments {
-		if err := keyring.Set(credentialsKeyringService, key, value); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func storeCredentialsInFile(path string, assignments map[string]string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("credentials store unavailable")
@@ -525,6 +502,16 @@ func storeCredentialsInFile(path string, assignments map[string]string) error {
 	if err != nil {
 		return err
 	}
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if key, ok := credentialClearedLineKey(line); ok {
+			if _, hit := assignments[key]; hit {
+				continue
+			}
+		}
+		filtered = append(filtered, line)
+	}
+	lines = filtered
 	replaced := map[string]bool{}
 	for i, line := range lines {
 		key, ok := credentialLineKey(line)
@@ -559,8 +546,12 @@ func removeCredentialFromFile(path, key string) error {
 		if k, ok := credentialLineKey(line); ok && k == key {
 			continue
 		}
+		if k, ok := credentialClearedLineKey(line); ok && k == key {
+			continue
+		}
 		out = append(out, line)
 	}
+	out = append(out, credentialClearedPrefix+key)
 	return writeCredentialFileLines(path, out)
 }
 
@@ -589,7 +580,7 @@ func writeCredentialFileLines(path string, lines []string) error {
 	}
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
 	}
@@ -628,6 +619,15 @@ func credentialLineKey(line string) (string, bool) {
 	return key, ok && isCredentialKey(key)
 }
 
+func credentialClearedLineKey(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, credentialClearedPrefix) {
+		return "", false
+	}
+	key := strings.TrimSpace(strings.TrimPrefix(trimmed, credentialClearedPrefix))
+	return key, isCredentialKey(key)
+}
+
 func isCredentialKey(key string) bool {
 	if key == "" {
 		return false
@@ -641,7 +641,15 @@ func isCredentialKey(key string) bool {
 	return true
 }
 
-func envFileHasKey(path, key string) bool {
+func envFileHasValue(path, key string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	value, ok := envFileValue(path, key)
+	return ok && strings.TrimSpace(value) != ""
+}
+
+func envFileHasClearedKey(path, key string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
@@ -650,7 +658,7 @@ func envFileHasKey(path, key string) bool {
 		return false
 	}
 	for _, line := range lines {
-		if k, ok := credentialLineKey(line); ok && k == key {
+		if k, ok := credentialClearedLineKey(line); ok && k == key {
 			return true
 		}
 	}

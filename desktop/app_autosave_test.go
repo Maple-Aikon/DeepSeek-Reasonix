@@ -32,7 +32,7 @@ func controllerWithContent(t *testing.T, path string) *control.Controller {
 	sess.Add(provider.Message{Role: provider.RoleUser, Content: "remember this turn"})
 	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "acknowledged"})
 	ag := agent.New(stubProvider{}, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
-	return control.New(control.Options{Executor: ag, SessionPath: path, Sink: event.Discard})
+	return control.New(control.Options{Executor: ag, SessionDir: filepath.Dir(path), SessionPath: path, Sink: event.Discard})
 }
 
 func waitForFile(t *testing.T, path, want string) {
@@ -49,7 +49,12 @@ func waitForFile(t *testing.T, path, want string) {
 
 func waitForAutosaveIdle(t *testing.T, tab *WorkspaceTab) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	waitForAutosaveIdleWithin(t, tab, 2*time.Second)
+}
+
+func waitForAutosaveIdleWithin(t *testing.T, tab *WorkspaceTab, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		tab.saveMu.Lock()
 		idle := !tab.saving && !tab.saveAgain
@@ -132,6 +137,91 @@ func TestScheduleSnapshotCoalesces(t *testing.T) {
 	waitForAutosaveIdle(t, tab)
 }
 
+func TestAutosaveFailureRetriesAndRecoversOnNextTurnDone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.jsonl")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("mkdir blocked path: %v", err)
+	}
+	a, tab := appWithTab(t, path)
+	_ = a
+
+	tab.sink.Emit(event.Event{Kind: event.TurnDone})
+	waitForAutosaveIdleWithin(t, tab, 5*time.Second)
+
+	tab.saveMu.Lock()
+	failures := tab.saveFailures
+	tab.saveMu.Unlock()
+	if failures == 0 {
+		t.Fatal("autosave failure should be recorded and retried")
+	}
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		t.Fatalf("blocked session path should still be the directory, info=%v err=%v", info, err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove blocked dir: %v", err)
+	}
+	tab.sink.Emit(event.Event{Kind: event.TurnDone})
+	waitForFile(t, path, "remember this turn")
+	waitForAutosaveIdle(t, tab)
+
+	tab.saveMu.Lock()
+	failures = tab.saveFailures
+	tab.saveMu.Unlock()
+	if failures != 0 {
+		t.Fatalf("autosave failures after recovery = %d, want 0", failures)
+	}
+}
+
+func TestSetActiveTabBlocksWhenCurrentSessionCannotPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.jsonl")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("mkdir blocked path: %v", err)
+	}
+	a, _ := appWithTab(t, path)
+	a.tabs["target_tab"] = &WorkspaceTab{
+		ID:          "target_tab",
+		Scope:       "global",
+		Ready:       true,
+		disabledMCP: map[string]ServerView{},
+	}
+	a.tabOrder = []string{"test_tab", "target_tab"}
+
+	err := a.SetActiveTab("target_tab")
+	if err == nil || !strings.Contains(err.Error(), "save current session before switching tabs") {
+		t.Fatalf("SetActiveTab error = %v, want persistence failure", err)
+	}
+	if a.activeTabID != "test_tab" {
+		t.Fatalf("active tab = %q, want original tab after failed save", a.activeTabID)
+	}
+}
+
+func TestRebindSessionBlocksWhenCurrentSessionCannotPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.jsonl")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("mkdir blocked path: %v", err)
+	}
+	a, tab := appWithTab(t, path)
+	target := filepath.Join(t.TempDir(), "target.jsonl")
+	sess := agent.NewSession("system")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "target prompt"})
+	if err := sess.Save(target); err != nil {
+		t.Fatalf("save target: %v", err)
+	}
+	loaded, err := agent.LoadSession(target)
+	if err != nil {
+		t.Fatalf("load target: %v", err)
+	}
+
+	err = a.rebindTabToLoadedSessionPath(tab, target, loaded)
+	if err == nil || !strings.Contains(err.Error(), "save current session before switching sessions") {
+		t.Fatalf("rebind error = %v, want persistence failure", err)
+	}
+	if tab.Ctrl == nil || tab.Ctrl.SessionPath() != path {
+		t.Fatalf("tab controller/path changed after failed save: ctrl=%v path=%q", tab.Ctrl, tab.currentSessionPath())
+	}
+}
+
 // TestCloseTabNoResurrectionFromAutosave is the regression test for #4384.
 // It proves that after CloseTab returns, the per-turn autosave goroutine can no
 // longer write the session file — even when it is in flight at the moment the
@@ -187,6 +277,34 @@ func TestCloseTabNoResurrectionFromAutosave(t *testing.T) {
 	}
 }
 
+func TestCloseTabBlocksWhenSessionCannotPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.jsonl")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("mkdir blocked path: %v", err)
+	}
+	a, tab := appWithTab(t, path)
+	survivor := &WorkspaceTab{
+		ID:          "survivor_tab",
+		Scope:       "global",
+		Ready:       true,
+		disabledMCP: map[string]ServerView{},
+	}
+	survivor.sink = &tabEventSink{tabID: survivor.ID, app: a}
+	a.tabs[survivor.ID] = survivor
+	a.tabOrder = []string{tab.ID, survivor.ID}
+
+	err := a.CloseTab(tab.ID)
+	if err == nil || !strings.Contains(err.Error(), "save current session before closing tab") {
+		t.Fatalf("CloseTab error = %v, want persistence failure", err)
+	}
+	if _, ok := a.tabs[tab.ID]; !ok {
+		t.Fatal("tab was removed even though its session could not be saved")
+	}
+	if tab.Ctrl == nil || tab.Ctrl.SessionPath() != path {
+		t.Fatalf("tab controller/path changed after failed close: ctrl=%v path=%q", tab.Ctrl, tab.currentSessionPath())
+	}
+}
+
 // TestCloseTabSurvivorKeepsAutosave ensures the survivor tab is untouched: the
 // closing/drain logic is per-tab and must not leak to other tabs.
 func TestCloseTabSurvivorKeepsAutosave(t *testing.T) {
@@ -219,5 +337,101 @@ func TestCloseTabSurvivorKeepsAutosave(t *testing.T) {
 	}
 	if survivor.closing {
 		t.Fatal("survivor tab was marked closing — closing flag leaked across tabs")
+	}
+}
+
+func TestDeleteSessionClearsRemovedRuntimeSessionPath(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "delete-open.jsonl")
+	ctrl := controllerWithContent(t, path)
+	tab := &WorkspaceTab{
+		ID:          "delete_open",
+		Scope:       "global",
+		Ready:       true,
+		Ctrl:        ctrl,
+		disabledMCP: map[string]ServerView{},
+	}
+	app := &App{
+		tabs:        map[string]*WorkspaceTab{"delete_open": tab},
+		activeTabID: "delete_open",
+	}
+	if err := ctrl.Snapshot(); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	if err := app.DeleteSession(path); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	if got := ctrl.SessionPath(); got != "" {
+		t.Fatalf("removed controller session path = %q, want empty before trash move can race Windows file locks", got)
+	}
+	trashPath := filepath.Join(dir, sessionTrashDir, "delete-open.jsonl", "delete-open.jsonl")
+	if _, err := os.Stat(trashPath); err != nil {
+		t.Fatalf("session should be in trash: %v", err)
+	}
+}
+
+func TestTrashTopicClearsRemovedRuntimeSessionPath(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	topicID := "topic_clear_removed_runtime"
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := setTopicTitle(projectRoot, topicID, "Clear removed runtime"); err != nil {
+		t.Fatalf("set topic title: %v", err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trash-open-topic.jsonl")
+	ctrl := controllerWithContent(t, path)
+	if err := ctrl.Snapshot(); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if err := agent.SaveBranchMeta(path, agent.BranchMeta{
+		CreatedAt:     time.Now().Add(-time.Minute),
+		UpdatedAt:     time.Now(),
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+		TopicID:       topicID,
+		TopicTitle:    "Clear removed runtime",
+	}); err != nil {
+		t.Fatalf("save branch meta: %v", err)
+	}
+	tab := &WorkspaceTab{
+		ID:            "trash_open",
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+		TopicID:       topicID,
+		TopicTitle:    "Clear removed runtime",
+		Ready:         true,
+		Ctrl:          ctrl,
+		disabledMCP:   map[string]ServerView{},
+	}
+	survivor := &WorkspaceTab{
+		ID:          "survivor",
+		Scope:       "global",
+		Ready:       true,
+		disabledMCP: map[string]ServerView{},
+	}
+	app := &App{
+		tabs:        map[string]*WorkspaceTab{"trash_open": tab, "survivor": survivor},
+		tabOrder:    []string{"trash_open", "survivor"},
+		activeTabID: "trash_open",
+	}
+
+	if err := app.TrashTopic(topicID); err != nil {
+		t.Fatalf("TrashTopic: %v", err)
+	}
+
+	if got := ctrl.SessionPath(); got != "" {
+		t.Fatalf("removed topic controller session path = %q, want empty before trash move can race Windows file locks", got)
+	}
+	trashPath := filepath.Join(dir, sessionTrashDir, "trash-open-topic.jsonl", "trash-open-topic.jsonl")
+	if _, err := os.Stat(trashPath); err != nil {
+		t.Fatalf("topic session should be in trash: %v", err)
 	}
 }

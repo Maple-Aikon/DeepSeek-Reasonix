@@ -87,14 +87,72 @@ func TestProviderFetchModelsFallsBackToV1Models(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	t.Setenv("FETCH_MODELS_TEST_KEY", "test-key")
-	p := ProviderEntry{Name: "test", BaseURL: srv.URL, APIKeyEnv: "FETCH_MODELS_TEST_KEY"}
+	p := ProviderEntry{Name: "test", BaseURL: srv.URL, APIKeyEnv: "FETCH_MODELS_TEST_KEY", resolvedAPIKey: "test-key"}
 	got, err := p.FetchModels(context.Background())
 	if err != nil {
 		t.Fatalf("FetchModels: %v", err)
 	}
 	if len(got) != 2 || got[0] != "model-a" || got[1] != "model-b" {
 		t.Fatalf("got %v, want [model-a model-b]", got)
+	}
+}
+
+func TestProviderFetchModelsContinuesAfterRootAuthFailure(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/models":
+			http.Error(w, `{"error":"wrong endpoint"}`, http.StatusUnauthorized)
+		case "/v1/models":
+			if r.Header.Get("Authorization") != "Bearer test-key" {
+				http.Error(w, "bad key", http.StatusUnauthorized)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": "model-a"}},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := ProviderEntry{Name: "test", BaseURL: srv.URL, APIKeyEnv: "FETCH_MODELS_TEST_KEY", resolvedAPIKey: "test-key"}
+	got, err := p.FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if len(got) != 1 || got[0] != "model-a" {
+		t.Fatalf("got %v, want [model-a]", got)
+	}
+	if len(paths) != 2 || paths[0] != "/models" || paths[1] != "/v1/models" {
+		t.Fatalf("paths = %v, want [/models /v1/models]", paths)
+	}
+}
+
+func TestProviderFetchModelsUsesSetupProbeEnv(t *testing.T) {
+	const key = "FETCH_MODELS_PROBE_KEY"
+	t.Setenv(key, "probe-key")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer probe-key" {
+			http.Error(w, "bad key", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]string{{"id": "probe-model"}},
+		})
+	}))
+	defer srv.Close()
+
+	p := ProviderEntry{Name: "probe", BaseURL: srv.URL, APIKeyEnv: key}
+	p.ResolveAPIKeyFromProcessEnvForProbe()
+	got, err := p.FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if len(got) != 1 || got[0] != "probe-model" {
+		t.Fatalf("models = %v, want [probe-model]", got)
 	}
 }
 

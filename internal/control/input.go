@@ -2,16 +2,21 @@ package control
 
 import (
 	"context"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/planmode"
 	"reasonix/internal/skill"
 )
 
 // PlanModeMarker is prepended to every user turn while plan mode is on. It rides
 // in the user message (not the system prompt or tools), so the cache-stable
 // prompt prefix is left untouched and the toggle costs nothing in cache hits.
-const PlanModeMarker = "[Plan mode — read-only. Explore the codebase first (read_file, ls, grep, glob, web_fetch, task, ask are available; writers are refused by the harness). Before planning, if a decision that is genuinely the user's — tech stack, an ambiguous requirement, scope, an irreversible choice — would materially shape the plan and you can't settle it from the codebase or a sensible default, use the ask tool to clarify it first; otherwise pick the obvious default and state the assumption in the plan instead of asking. Then present a LAYERED plan as your reply and stop — do not write files, edit, or run side-effecting bash. Structure the plan as a two-level markdown list so it becomes a layered task list: each PHASE is a top-level numbered list item (a coherent milestone, e.g. \"1. Add the config loader\"), and each phase's concrete, verifiable sub-steps are bullets indented beneath it (e.g. \"   - parse the TOML into Config\"). Use plain numbered list items for phases — do NOT write phases as markdown headings (##, ###) — so both levels parse. Keep phases few (about 2-6). The user will be asked to approve before any changes are made.]"
+const PlanModeMarker = planmode.Marker
+
+const legacyPlanModeMarker = "[Plan mode — read-only. Explore the codebase first (read_file, ls, grep, glob, web_fetch, task, ask are available; writers are refused by the harness). Before planning, if a decision that is genuinely the user's — tech stack, an ambiguous requirement, scope, an irreversible choice — would materially shape the plan and you can't settle it from the codebase or a sensible default, use the ask tool to clarify it first; otherwise pick the obvious default and state the assumption in the plan instead of asking. Then present a LAYERED plan as your reply and stop — do not write files, edit, or run side-effecting bash. Structure the plan as a two-level markdown list so it becomes a layered task list: each PHASE is a top-level numbered list item (a coherent milestone, e.g. \"1. Add the config loader\"), and each phase's concrete, verifiable sub-steps are bullets indented beneath it (e.g. \"   - parse the TOML into Config\"). Use plain numbered list items for phases — do NOT write phases as markdown headings (##, ###) — so both levels parse. Keep phases few (about 2-6). The user will be asked to approve before any changes are made.]"
 
 const (
 	activeGoalOpen  = "<active-goal>"
@@ -25,6 +30,14 @@ const (
 	GoalStatusStopped  = "stopped"
 )
 
+type GoalResearchMode int
+
+const (
+	GoalResearchAuto GoalResearchMode = iota
+	GoalResearchOn
+	GoalResearchOff
+)
+
 // StripComposePrefixes removes controller-injected prefixes from a composed
 // user message so that the display text matches what the user actually typed.
 // It strips the PlanModeMarker plus transient XML blocks such as
@@ -34,9 +47,56 @@ const (
 // feature, or synthetic user messages injected by the controller).
 func StripComposePrefixes(content string) string {
 	s := agent.StripTransientUserBlocks(content)
-	s = strings.TrimPrefix(s, PlanModeMarker+"\n\n")
-	s = strings.TrimPrefix(s, PlanModeMarker)
+	s = stripComposeMarker(s, PlanModeMarker)
+	s = stripComposeMarker(s, legacyPlanModeMarker)
 	s = strings.TrimSpace(s)
+	return s
+}
+
+func stripComposeMarker(s, marker string) string {
+	s = strings.TrimPrefix(s, marker+"\n\n")
+	return strings.TrimPrefix(s, marker)
+}
+
+// StripReferencedContextPrefix removes the "Referenced context:" preamble and
+// the trailing XML reference blocks (<file>, <dir>, <resource>, <image>) that
+// controller.ResolveRefs injects when the user @-references files or resources.
+// The user's actual input follows the reference blocks after a blank line.
+// Used for title generation and previews so the displayed text matches what
+// the user typed, not the injected context preamble (#4954).
+func StripReferencedContextPrefix(content string) string {
+	const preamble = "Referenced context:"
+	s := strings.TrimSpace(content)
+	if !strings.HasPrefix(s, preamble) {
+		return content
+	}
+	// Skip past the preamble.
+	s = strings.TrimSpace(s[len(preamble):])
+	// Skip past all XML reference blocks: <file ...>...</file>, <dir ...>...</dir>,
+	// <resource ...>...</resource>, <image ...>...</image>.
+	for {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return ""
+		}
+		// Check for a reference block start.
+		if !strings.HasPrefix(s, "<file ") && !strings.HasPrefix(s, "<dir ") &&
+			!strings.HasPrefix(s, "<resource ") && !strings.HasPrefix(s, "<image ") {
+			break
+		}
+		// Find the matching close tag.
+		tagEnd := strings.IndexByte(s, ' ')
+		if tagEnd < 0 {
+			break
+		}
+		tagName := s[1:tagEnd]
+		closeTag := "</" + tagName + ">"
+		closeIdx := strings.Index(s, closeTag)
+		if closeIdx < 0 {
+			break
+		}
+		s = strings.TrimSpace(s[closeIdx+len(closeTag):])
+	}
 	return s
 }
 
@@ -58,7 +118,7 @@ func IsSyntheticUserMessage(content string) bool {
 }
 
 // syntheticPrefixes must be kept in sync with the synthetic user messages
-// injected by the controller (planApprovedMessage), agent loop
+// injected by the controller (planApprovedMessage, goal loop turns), agent loop
 // (streamRecoveryMessage, finalReadinessRetryMessage, emptyFinalRetryMessage,
 // executorHandoffRetryMessage in internal/agent/agent.go), and compaction
 // folds (internal/agent/compact.go), which store summaries as user-role
@@ -74,6 +134,10 @@ var syntheticPrefixes = []string{
 	"<compaction-summary>",
 	"Summary of the later conversation (compacted from here on):",
 	"Summary of earlier conversation (compacted up to here):",
+	"Continue pursuing the active goal.",
+	"The agent signaled goal completion and all tasks are marked done.",
+	"Goal signaled complete but issues remain:",
+	"No tool calls in recent turns.",
 }
 
 // Compose applies the plan-mode marker to a turn's text when plan mode is on,
@@ -82,19 +146,23 @@ var syntheticPrefixes = []string{
 func (c *Controller) Compose(text string) string {
 	c.mu.Lock()
 	plan := c.planMode
-	goal := c.goal
-	goalStatus := c.goalStatus
+	responseLanguage := c.responseLanguage
 	reasoningLanguage := c.reasoningLanguage
-	notes := c.pendingMemory
-	c.pendingMemory = nil
 	c.mu.Unlock()
+	notes := c.memory.drainPending()
+	goal, goalStatus, goalResearchMode, autoResearchTaskID := c.goals.snapshot()
 
 	if strings.TrimSpace(goal) != "" && goalStatus == GoalStatusRunning {
-		text = activeGoalBlock(goal) + "\n\n" + text
+		prefix := activeGoalBlock(goal, goalResearchMode)
+		if runtime := c.autoResearchRuntimeBlock(autoResearchTaskID); runtime != "" {
+			prefix += "\n\n" + runtime
+		}
+		text = prefix + "\n\n" + text
 	}
 	if plan {
 		text = PlanModeMarker + "\n\n" + text
 	}
+	text = agent.WithResponseLanguage(text, responseLanguage)
 	text = agent.WithReasoningLanguage(text, reasoningLanguage)
 
 	// Memory added mid-session rides the turn (never the cached system prefix),
@@ -122,18 +190,67 @@ func (c *Controller) Compose(text string) string {
 	return text
 }
 
+func (c *Controller) autoResearchRuntimeBlock(taskID string) string {
+	if c.autoResearch == nil || strings.TrimSpace(taskID) == "" {
+		return ""
+	}
+	summary, err := c.autoResearch.Summary(taskID)
+	if err != nil {
+		return "<autoresearch-runtime>\nstatus: invalid\nerror: " + strings.ReplaceAll(err.Error(), autoResearchRuntimeClose, "<\\/autoresearch-runtime>") + "\n</autoresearch-runtime>"
+	}
+	var b strings.Builder
+	b.WriteString("<autoresearch-runtime>\n")
+	b.WriteString("task_id: " + summary.TaskID + "\n")
+	b.WriteString("status: " + summary.Status + "\n")
+	b.WriteString("iteration: ")
+	b.WriteString(strconv.Itoa(summary.Iteration))
+	b.WriteString("\n")
+	b.WriteString("current_direction: " + summary.CurrentDirection + "\n")
+	b.WriteString("stale_count: ")
+	b.WriteString(strconv.Itoa(summary.StaleCount))
+	b.WriteString("\n")
+	b.WriteString("pivot_count: ")
+	b.WriteString(strconv.Itoa(summary.PivotCount))
+	b.WriteString("\n")
+	if summary.PivotRequired {
+		b.WriteString("pivot_required: true\n")
+	} else {
+		b.WriteString("pivot_required: false\n")
+	}
+	b.WriteString("open_success_criteria: ")
+	b.WriteString(strconv.Itoa(len(summary.OpenCriteria)))
+	b.WriteString("\n")
+	for _, criterion := range summary.OpenCriteria {
+		b.WriteString("- ")
+		b.WriteString(criterion.ID)
+		b.WriteString(": ")
+		b.WriteString(strings.ReplaceAll(criterion.Description, "\n", " "))
+		b.WriteString("\n")
+	}
+	if summary.Blocker != "" {
+		b.WriteString("blocker: " + summary.Blocker + "\n")
+	}
+	b.WriteString("next_required_action: " + summary.NextRequiredAction + "\n")
+	b.WriteString("</autoresearch-runtime>")
+	return b.String()
+}
+
+const autoResearchRuntimeClose = "</autoresearch-runtime>"
+
 func reasoningLanguageBlock(lang string) string {
 	return agent.ReasoningLanguageBlock(lang)
 }
 
 func (c *Controller) ComposeSynthetic(text string) string {
 	c.mu.Lock()
+	responseLang := c.responseLanguage
 	lang := c.reasoningLanguage
 	c.mu.Unlock()
+	text = agent.WithResponseLanguage(text, responseLang)
 	return agent.WithReasoningLanguage(text, lang)
 }
 
-func activeGoalBlock(goal string) string {
+func activeGoalBlock(goal string, researchMode GoalResearchMode) string {
 	goal = strings.TrimSpace(goal)
 	goal = strings.ReplaceAll(goal, activeGoalClose, "<\\/active-goal>")
 	var b strings.Builder
@@ -142,9 +259,169 @@ func activeGoalBlock(goal string) string {
 	b.WriteString(goal)
 	b.WriteString("\n\n")
 	b.WriteString("Goal mode: pursue this goal autonomously. Keep working across turns until the goal is complete. Prefer sensible defaults over asking the user; use ask only when you are truly blocked on a user-owned decision. Do not stop after describing a plan; execute the next useful step. End every goal-mode assistant reply with exactly one status marker on its own line: [goal:continue], [goal:complete], or [goal:blocked:<short reason>].")
+	if shouldUseAutoResearch(goal, researchMode) {
+		b.WriteString("\n\n")
+		b.WriteString(autoResearchGoalInstructions)
+	}
 	b.WriteString("\n")
 	b.WriteString(activeGoalClose)
 	return b.String()
+}
+
+const autoResearchGoalInstructions = `AutoResearch protocol: this goal looks like long-horizon research, debugging, optimization, or implementation work. Treat AutoResearch as a durable strategy for this Goal, not as a background daemon or a global skill.
+- Say briefly in the first visible reply that the goal is being handled with AutoResearch and that host-owned state lives under .reasonix/autoresearch/<task-id>/, using the actual task_id from <autoresearch-runtime>.
+- Keep dynamic state out of REASONIX.md, AGENTS.md, project memory, system prompts, and tool schemas. Use project-local .reasonix/autoresearch/ state only.
+- Use the task_id and open_success_criteria in <autoresearch-runtime> as authoritative. The host creates task ids and owns state/task_spec.json, state/progress.json, state/findings.jsonl, state/directions_tried.json, state/iteration_log.jsonl, and logs/heartbeat.jsonl.
+- Do not hand-edit the host-owned AutoResearch state files. When you have direct evidence for an open criterion, include an <autoresearch-evidence> block in your assistant reply so the host can persist it:
+<autoresearch-evidence>
+{"criterion_id":"objective_evidence","kind":"file","summary":"What was directly observed","source":"file","paths":["relative/path"],"accepted":true}
+</autoresearch-evidence>
+- Before each iteration, use the runtime summary as authoritative, choose a direction that differs materially from directions already tried, execute the smallest evidence-producing chunk, verify it, and report accepted evidence with <autoresearch-evidence> blocks.
+- Increment stale_count when an iteration lacks accepted evidence or repeats a prior direction. At stale_count >= 2, make a structural pivot such as changing evidence source, entrypoint, implementation boundary, test oracle, benchmark, decomposition, environment, platform, or refutation angle. At stale_count >= 4, stop autonomous digging and ask for the smallest external input needed.
+- Workers or subagents may gather evidence, but the orchestrator owns canonical state writes. Workers must not publish, push, delete, contact external systems, or write canonical state unless explicitly designated.
+- Complete only after auditing every open success criterion in <autoresearch-runtime> against direct evidence. Public publishing, destructive changes, credential use, payments, external notifications, privacy-sensitive output, and cache-sensitive changes still require the normal Reasonix gates.`
+
+func shouldUseAutoResearch(goal string, mode GoalResearchMode) bool {
+	switch mode {
+	case GoalResearchOn:
+		return true
+	case GoalResearchOff:
+		return false
+	}
+	return isAutoResearchGoal(goal)
+}
+
+func shouldAutoStartResearchGoal(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "!") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, ".reasonix/autoresearch/") {
+		return true
+	}
+	for _, phrase := range autoResearchAutoStartPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	categories := autoResearchPhaseCount(lower)
+	switch {
+	case strings.Contains(lower, "彻底") && categories >= 3:
+		return true
+	case strings.Contains(lower, "完整") && categories >= 3:
+		return true
+	case strings.Contains(lower, "长期") && categories >= 2 && containsAnyGoalKeyword(lower, []string{"实验", "验证", "修复", "排查", "优化"}):
+		return true
+	case strings.Contains(lower, "thoroughly") && categories >= 3:
+		return true
+	case strings.Contains(lower, "complete") && categories >= 3:
+		return true
+	}
+	return false
+}
+
+func isAutoResearchGoal(goal string) bool {
+	trimmed := strings.TrimSpace(goal)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, ".reasonix/autoresearch/") {
+		return true
+	}
+	for _, kw := range autoResearchStrongKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return autoResearchPhaseCount(lower) >= 4
+}
+
+func autoResearchPhaseCount(lower string) int {
+	categories := 0
+	for _, group := range autoResearchPhaseKeywords {
+		if containsAnyGoalKeyword(lower, group) {
+			categories++
+		}
+	}
+	return categories
+}
+
+var autoResearchAutoStartPhrases = []string{
+	"直到根因",
+	"根因明确",
+	"多轮排查",
+	"不要原地打转",
+	"别原地打转",
+	"完整做成方案",
+	"完整方案并验证",
+	"跑实验",
+	"反复验证",
+	"系统性研究",
+	"持续研究",
+	"持续排查",
+	"持续推进",
+	"长期跑",
+	"until the root cause",
+	"root cause is clear",
+	"debug until",
+	"do not spin",
+	"don't spin",
+	"keep researching",
+	"long-horizon",
+	"long horizon",
+	"long-running",
+}
+
+var autoResearchStrongKeywords = []string{
+	"持续",
+	"长期",
+	"彻底",
+	"直到根因",
+	"根因明确",
+	"多轮",
+	"不要原地打转",
+	"别原地打转",
+	"完整方案",
+	"完整做成方案",
+	"跑实验",
+	"反复验证",
+	"长期优化",
+	"系统性研究",
+	"持续研究",
+	"持续排查",
+	"持续推进",
+	"长期跑",
+	"long-horizon",
+	"long horizon",
+	"long-running",
+	"keep researching",
+	"keep working",
+	"root cause",
+	"until the root cause",
+	"do not spin",
+	"don't spin",
+	"thoroughly",
+	"systematically",
+}
+
+var autoResearchPhaseKeywords = [][]string{
+	{"研究", "调研", "排查", "分析", "定位", "诊断", "research", "investigate", "diagnose", "analyze", "analysis"},
+	{"实现", "修复", "改造", "开发", "重构", "implement", "build", "fix", "refactor"},
+	{"验证", "测试", "复现", "联调", "benchmark", "verify", "validate", "test", "reproduce"},
+	{"优化", "完善", "提升", "收敛", "optimize", "improve", "tune", "polish"},
+	{"文档", "方案", "说明", "总结", "document", "docs", "writeup", "plan"},
+	{"发布", "上线", "提交", "pull request", "publish", "ship", "deploy"},
+}
+
+func containsAnyGoalKeyword(s string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // MemoryQuickAddNote parses the "# <note>" memory shortcut. The space after
@@ -186,8 +463,10 @@ const (
 )
 
 type GoalCommand struct {
-	Action GoalCommandAction
-	Text   string
+	Action       GoalCommandAction
+	Text         string
+	Strict       bool
+	ResearchMode GoalResearchMode
 }
 
 func ParseGoalCommand(input string) (GoalCommand, bool) {
@@ -196,14 +475,46 @@ func ParseGoalCommand(input string) (GoalCommand, bool) {
 		return GoalCommand{}, false
 	}
 	args := strings.TrimSpace(trimmed[len("/goal"):])
-	switch strings.ToLower(args) {
+	strict, researchMode, actionArgs := parseLeadingGoalFlags(args)
+
+	switch strings.ToLower(actionArgs) {
 	case "", "status":
-		return GoalCommand{Action: GoalCommandStatus}, true
+		return GoalCommand{Action: GoalCommandStatus, Strict: strict, ResearchMode: researchMode}, true
 	case "clear", "off", "stop", "done":
-		return GoalCommand{Action: GoalCommandClear}, true
+		return GoalCommand{Action: GoalCommandClear, Strict: strict, ResearchMode: researchMode}, true
 	default:
-		return GoalCommand{Action: GoalCommandSet, Text: args}, true
+		return GoalCommand{Action: GoalCommandSet, Text: actionArgs, Strict: strict, ResearchMode: researchMode}, true
 	}
+}
+
+func parseLeadingGoalFlags(args string) (bool, GoalResearchMode, string) {
+	strict := false
+	mode := GoalResearchAuto
+	rest := strings.TrimLeftFunc(args, unicode.IsSpace)
+	for rest != "" {
+		token, after := leadingGoalToken(rest)
+		switch strings.ToLower(token) {
+		case "--strict":
+			strict = true
+		case "--research", "--auto-research", "--deep":
+			mode = GoalResearchOn
+		case "--simple", "--no-research":
+			mode = GoalResearchOff
+		default:
+			return strict, mode, strings.TrimSpace(rest)
+		}
+		rest = strings.TrimLeftFunc(after, unicode.IsSpace)
+	}
+	return strict, mode, ""
+}
+
+func leadingGoalToken(s string) (string, string) {
+	for i, r := range s {
+		if unicode.IsSpace(r) {
+			return s[:i], s[i:]
+		}
+	}
+	return s, ""
 }
 
 // CustomCommand resolves a "/name args…" line against the loaded custom slash
@@ -215,7 +526,7 @@ func (c *Controller) CustomCommand(input string) (sent string, found bool) {
 		return "", false
 	}
 	name := strings.TrimPrefix(fields[0], "/")
-	for _, cmd := range c.commands {
+	for _, cmd := range c.Commands() {
 		if cmd.Name == name {
 			return cmd.Render(fields[1:]), true
 		}
@@ -235,22 +546,10 @@ func (c *Controller) RunSkill(input string) (sent string, found bool) {
 		return "", false
 	}
 	name := strings.TrimPrefix(fields[0], "/")
-	if sk, ok := c.skillByName(name); ok {
+	if sk, ok := c.skills.byName(name); ok {
 		return skill.Render(sk, strings.Join(fields[1:], " ")), true
 	}
 	return "", false
-}
-
-func (c *Controller) skillByName(name string) (skill.Skill, bool) {
-	if c.skillStore != nil {
-		return c.skillStore.Read(name)
-	}
-	for _, sk := range c.skills {
-		if sk.Name == name {
-			return sk, true
-		}
-	}
-	return skill.Skill{}, false
 }
 
 // MCPPrompt resolves a "/mcp__server__prompt args…" line: it maps the positional
@@ -258,16 +557,13 @@ func (c *Controller) skillByName(name string) (skill.Skill, bool) {
 // the MCP server (an async prompts/get). found is false when no such prompt
 // exists; err carries a fetch failure. Honours ctx.
 func (c *Controller) MCPPrompt(ctx context.Context, input string) (sent string, found bool, err error) {
-	if c.host == nil {
-		return "", false, nil
-	}
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
 		return "", false, nil
 	}
 	name := strings.TrimPrefix(fields[0], "/")
 
-	prompts := c.host.Prompts()
+	prompts := c.mcp.prompts()
 	idx := -1
 	for i := range prompts {
 		if prompts[i].Name == name {

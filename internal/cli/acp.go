@@ -74,13 +74,14 @@ func (f *acpFactory) NewSession(ctx context.Context, p acp.SessionParams) (*cont
 		return nil, fmt.Errorf("session cwd must be an absolute path: %s", root)
 	}
 	return boot.Build(ctx, boot.Options{
-		Model:          firstNonEmpty(p.Model, f.model),
-		RequireKey:     true,
-		Sink:           p.Sink,
-		EffortOverride: p.EffortOverride,
-		Stderr:         os.Stderr,
-		WorkspaceRoot:  root,
-		ExtraPlugins:   p.MCPServers,
+		Model:                    firstNonEmpty(p.Model, f.model),
+		RequireKey:               true,
+		Sink:                     p.Sink,
+		EffortOverride:           p.EffortOverride,
+		Stderr:                   os.Stderr,
+		WorkspaceRoot:            root,
+		ExtraPlugins:             p.MCPServers,
+		CleanupPendingReconciler: acp.ReconcileCleanupPending,
 	})
 }
 
@@ -94,7 +95,7 @@ func (f *acpFactory) SessionConfigState(_ context.Context, p acp.SessionConfigSt
 	if root != "" && !filepath.IsAbs(root) {
 		return acp.SessionConfigState{}, fmt.Errorf("session cwd must be an absolute path: %s", root)
 	}
-	_, _ = config.MigrateLegacyIfNeeded()
+	_, _ = config.MigrateLegacyIfNeededForRoot(root)
 	_, _ = config.MigrateMCPToUserConfigOnUpgrade([]string{root})
 	cfg, err := config.LoadForRoot(root)
 	if err != nil {

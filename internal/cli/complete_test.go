@@ -36,9 +36,12 @@ func TestSlashCompletionFilterAndAccept(t *testing.T) {
 	if !m.completion.active || m.completion.kind != compSlash {
 		t.Fatalf("typing /co should open the slash menu: %+v", m.completion)
 	}
-	// Only /compact matches the "/co" prefix among the built-ins.
-	if len(m.completion.items) != 1 || m.completion.items[0].label != "/compact" {
-		t.Fatalf("filter = %v, want just /compact", labels(m.completion.items))
+	// /compact and /copy both start with "/co".
+	if len(m.completion.items) != 2 {
+		t.Fatalf("filter = %v, want /compact and /copy", labels(m.completion.items))
+	}
+	if m.completion.items[0].label != "/compact" || m.completion.items[1].label != "/copy" {
+		t.Fatalf("filter = %v, want [/compact /copy]", labels(m.completion.items))
 	}
 
 	m.acceptCompletion()
@@ -408,6 +411,18 @@ func TestSlashArgCompletionSwitchBranches(t *testing.T) {
 	if err := agent.SaveBranchMeta(childPath, agent.BranchMeta{Name: "experiment", ParentID: agent.BranchID(rootPath)}); err != nil {
 		t.Fatal(err)
 	}
+	pending := agent.NewSession("sys")
+	pending.Add(provider.Message{Role: provider.RoleUser, Content: "pending child prompt"})
+	pendingPath := filepath.Join(dir, "pending.jsonl")
+	if err := pending.Save(pendingPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.SaveBranchMeta(pendingPath, agent.BranchMeta{Name: "exp-pending", ParentID: agent.BranchID(rootPath)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.MarkCleanupPending(pendingPath, "delete"); err != nil {
+		t.Fatal(err)
+	}
 
 	m := newTestChatTUI()
 	m.ctrl = ctrl
@@ -466,6 +481,20 @@ func TestSlashArgCompletionReasoningLanguage(t *testing.T) {
 	}
 	if hasLabel(m.completion.items, "中文") {
 		t.Fatalf("/reasoning-language completion should expose only auto|zh|en: %v", labels(m.completion.items))
+	}
+}
+
+func TestSlashArgCompletionMemoryV5(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("/memory-v5 ")
+	m.updateCompletion()
+	if !m.completion.active || m.completion.kind != compSlashArg {
+		t.Fatalf("/memory-v5 should open arg completion: %+v", m.completion)
+	}
+	for _, want := range []string{"status", "off", "observe", "compact", "on"} {
+		if !hasLabel(m.completion.items, want) {
+			t.Fatalf("/memory-v5 completion missing %q: %v", want, labels(m.completion.items))
+		}
 	}
 }
 

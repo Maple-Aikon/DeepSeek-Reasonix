@@ -469,6 +469,61 @@ func TestSetAutoApproveToolsDoesNotDrainPendingPlanApproval(t *testing.T) {
 	}
 }
 
+func TestSetAutoApproveToolsDoesNotDrainPendingMCPReadOnlyTrust(t *testing.T) {
+	approvalRequests := make(chan event.Approval, 1)
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				approvalRequests <- e.Approval
+			}
+		}),
+	})
+
+	type trustResult struct {
+		allow  bool
+		reason string
+		err    error
+	}
+	done := make(chan trustResult, 1)
+	req := agent.PlanModeReadOnlyTrustRequest{
+		ToolName:    "mcp__github__issue_read",
+		ServerName:  "github",
+		RawToolName: "issue/read",
+	}
+	go func() {
+		allow, reason, err := planModeReadOnlyTrustApprover{c}.CheckPlanModeReadOnlyTrust(context.Background(), req)
+		done <- trustResult{allow: allow, reason: reason, err: err}
+	}()
+
+	var approval event.Approval
+	select {
+	case approval = <-approvalRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP read-only trust approval request was not emitted")
+	}
+
+	c.SetAutoApproveTools(true)
+
+	select {
+	case got := <-done:
+		t.Fatalf("SetAutoApproveTools must not auto-answer MCP read-only trust; got %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !c.AutoApproveTools() {
+		t.Fatal("tool auto-approval should turn on while MCP read-only trust stays pending")
+	}
+
+	c.Approve(approval.ID, true, false, false)
+	select {
+	case got := <-done:
+		if got.err != nil || !got.allow || got.reason != "" {
+			t.Fatalf("manual MCP read-only trust approval = %+v, want allow", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP read-only trust approval stayed blocked after Approve")
+	}
+}
+
 func TestSetAutoApproveToolsDoesNotDrainPendingMemoryApproval(t *testing.T) {
 	approvalRequests := make(chan event.Approval, 1)
 	c := New(Options{
@@ -771,7 +826,7 @@ func TestAskSerializesBehindPromptLockEvenWithAutoApproveTools(t *testing.T) {
 		},
 	}}
 
-	c.promptMu.Lock()
+	c.approval.promptMu.Lock()
 	started := make(chan struct{})
 	done := make(chan []event.AskAnswer, 1)
 	errs := make(chan error, 1)
@@ -804,7 +859,7 @@ func TestAskSerializesBehindPromptLockEvenWithAutoApproveTools(t *testing.T) {
 	}
 
 	// Release the lock — Ask proceeds but must still emit an AskRequest.
-	c.promptMu.Unlock()
+	c.approval.promptMu.Unlock()
 
 	var ask event.Ask
 	select {
@@ -851,7 +906,7 @@ func TestAskSerializesBehindPromptLockEvenWithBypass(t *testing.T) {
 		},
 	}}
 
-	c.promptMu.Lock()
+	c.approval.promptMu.Lock()
 	done := make(chan []event.AskAnswer, 1)
 	errs := make(chan error, 1)
 	go func() {
@@ -875,7 +930,7 @@ func TestAskSerializesBehindPromptLockEvenWithBypass(t *testing.T) {
 	// Enable bypass while Ask is queued behind promptMu.
 	c.SetBypass(true)
 	// Release the lock — Ask proceeds but must still emit an AskRequest.
-	c.promptMu.Unlock()
+	c.approval.promptMu.Unlock()
 
 	// Post-unlock assertion: Ask must emit AskRequest now that it holds the lock.
 	var ask event.Ask

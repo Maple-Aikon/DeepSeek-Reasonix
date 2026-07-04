@@ -17,8 +17,11 @@ export type EventKind =
   | "turn_done"
   | "compaction_started"
   | "compaction_done"
+  | "mcp_surface_ready"
   | "retrying"
-  | "steer";
+  | "steer"
+  | "memory_compiler_stats"
+  | "guardian_assessment";
 
 export interface WireCompaction {
   trigger?: string; // "auto" | "manual"
@@ -49,6 +52,18 @@ export interface WireTool {
   profile?: WireProfile; // subagent model/effort resolved for this call
 }
 
+export interface WireCacheDiagnostics {
+  prefixHash: string;
+  prefixChanged: boolean;
+  prefixChangeReasons?: string[];
+  systemHash: string;
+  toolsHash: string;
+  logRewriteVersion: number;
+  toolSchemaTokens: number;
+  cacheMissTokens: number;
+  cacheHitTokens: number;
+}
+
 export interface WireUsage {
   promptTokens: number;
   completionTokens: number;
@@ -57,6 +72,7 @@ export interface WireUsage {
   cacheMissTokens: number;
   reasoningTokens?: number;
   source?: string;
+  cacheDiagnostics?: WireCacheDiagnostics;
   // Session-cumulative cache tokens — the status bar shows the aggregate
   // hit-rate (Σhit/Σ(hit+miss)), steadier than the single-turn cacheHitTokens.
   sessionCacheHitTokens: number;
@@ -71,6 +87,19 @@ export interface WireApproval {
   id: string;
   tool: string;
   subject: string;
+  reason?: string;
+}
+
+export interface WireGuardian {
+  id: string;
+  tool: string;
+  subject: string;
+  outcome: string;
+  risk_level?: string;
+  user_authorization?: string;
+  rationale?: string;
+  duration_ms?: number;
+  usage?: WireUsage;
 }
 
 export interface WireAskOption {
@@ -97,16 +126,45 @@ export interface QuestionAnswer {
   selected: string[];
 }
 
+export interface MemoryCitation {
+  id?: string;
+  source: string;
+  lineStart?: number;
+  lineEnd?: number;
+  note?: string;
+  kind?: string;
+}
+
+export interface MemoryCompilerStats {
+  injected: boolean;
+  usefulIR: boolean;
+  compiledTokens: number;
+  irOverheadTokens: number;
+  memoryReferences: number;
+  constraints: number;
+  riskNotes: number;
+  executionSteps: number;
+  totalNodes: number;
+  highSignalNodes: number;
+  toolResultNodes: number;
+  decisionNodes: number;
+  strategyCount: number;
+  learningCount: number;
+}
+
 export interface WireEvent {
   kind: EventKind;
   text?: string;
   reasoning?: string;
+  memoryCitations?: MemoryCitation[];
+  memoryCompiler?: MemoryCompilerStats;
   level?: "info" | "warn";
   tool?: WireTool;
   usage?: WireUsage;
   approval?: WireApproval;
   ask?: WireAsk;
   compaction?: WireCompaction;
+  guardian?: WireGuardian;
   err?: string;
   retryAttempt?: number;
   retryMax?: number;
@@ -149,6 +207,7 @@ export interface TabMeta {
   tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
+  autoResearch?: AutoResearchCompactView;
   startupErr?: string;
   active: boolean;
   cwd: string;
@@ -189,6 +248,9 @@ export interface ContextPanelInfo {
   reasoningTokens: number;
   cacheHitTokens: number;
   cacheMissTokens: number;
+  sessionCacheHitTokens: number;
+  sessionCacheMissTokens: number;
+  sessionCompletionTokens: number;
   requestCount?: number;
   elapsedMs?: number;
   sessionCost?: number;
@@ -238,8 +300,10 @@ export interface HistoryMessage {
   role: string;
   content: string;
   submitText?: string;
+  checkpointTurn?: number;
   createdAt?: number;
   reasoning?: string;
+  memoryCitations?: MemoryCitation[];
   level?: "info" | "warn";
   toolCalls?: HistoryToolCall[];
   toolCallId?: string;
@@ -265,6 +329,14 @@ export interface HistoryToolCall {
   argumentsArchived?: boolean;
 }
 
+export interface HistoryPage {
+  messages: HistoryMessage[];
+  startTurn: number;
+  endTurn: number;
+  totalTurns: number;
+  hasOlder: boolean;
+}
+
 export interface PromptHistoryEntry {
   text: string;
   at: number;          // unix ms
@@ -284,6 +356,9 @@ export interface CheckpointMeta {
   turn: number;
   prompt: string;
   files: string[];
+  fileCount?: number;
+  filesTruncated?: boolean;
+  turnFileCount?: number;
   time: number; // unix ms
   canCode?: boolean;
   canConversation?: boolean;
@@ -336,6 +411,11 @@ export interface ContextInfo {
   window: number;
   sessionTokens: number;
   compactRatio?: number;
+  sessionCost?: number;
+  sessionCurrency?: string;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  sources?: Record<string, UsageSourceStats>;
 }
 
 export interface Meta {
@@ -347,7 +427,9 @@ export interface Meta {
   workspaceRoot?: string;
   workspaceName?: string;
   workspacePath?: string;
+  sessionPath?: string;
   gitBranch?: string;
+  imageInputEnabled?: boolean;
   autoApproveTools?: boolean;
   bypass?: boolean; // legacy JSON key for YOLO/full-access tool auto-approval
   collaborationMode?: CollaborationMode;
@@ -355,12 +437,62 @@ export interface Meta {
   tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
+  autoResearch?: AutoResearchCompactView;
 }
 
 export type CollaborationMode = "normal" | "plan" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
 export type TokenMode = "full" | "economy";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
+
+export interface AutoResearchCompactView {
+  taskId: string;
+  status: "running" | "blocked" | "complete" | "stopped" | "invalid";
+  iteration: number;
+  pivotRequired: boolean;
+  staleCount: number;
+}
+
+export interface AutoResearchCriterionView {
+  id: string;
+  description: string;
+  required: boolean;
+  evidenceCount: number;
+  status: string;
+}
+
+export interface AutoResearchStatusView extends AutoResearchCompactView {
+  goal: string;
+  currentDirection: string;
+  pivotCount: number;
+  lastHeartbeatAt: string;
+  findingCount: number;
+  openCriteria: AutoResearchCriterionView[];
+  blocker: string;
+  taskPath: string;
+  nextRequiredAction: string;
+}
+
+export interface AutoResearchFindingView {
+  id: string;
+  kind: string;
+  summary: string;
+  source: string;
+  command?: string;
+  paths?: string[];
+  accepted: boolean;
+  createdAt: string;
+}
+
+export interface AutoResearchEvidenceView {
+  id: string;
+  kind: string;
+  summary: string;
+  source: string;
+  command?: string;
+  paths?: string[];
+  accepted: boolean;
+}
 
 export function normalizeCollaborationMode(mode?: string, goal?: string, legacyMode?: Mode): CollaborationMode {
   if (mode === "plan" || mode === "goal" || mode === "normal") return mode;
@@ -369,9 +501,16 @@ export function normalizeCollaborationMode(mode?: string, goal?: string, legacyM
   return "normal";
 }
 
-export function normalizeToolApprovalMode(mode?: string, legacyMode?: Mode, legacyAutoApproveTools?: boolean): ToolApprovalMode {
-  if (mode === "auto" || mode === "yolo" || mode === "ask") return mode;
+export function normalizeToolApprovalMode(
+  mode?: string,
+  legacyMode?: Mode,
+  legacyAutoApproveTools?: boolean,
+  fallbackMode?: ToolApprovalMode,
+): ToolApprovalMode {
+  const normalized = typeof mode === "string" ? mode.trim().toLowerCase() : "";
+  if (normalized === "auto" || normalized === "yolo" || normalized === "ask") return normalized as ToolApprovalMode;
   if (legacyAutoApproveTools || (legacyMode && modeHasAutoApproveTools(legacyMode))) return "yolo";
+  if (fallbackMode === "auto" && normalized === "") return "auto";
   return "ask";
 }
 
@@ -423,13 +562,17 @@ export interface CommandInfo {
 
 export interface DirEntry {
   name: string;
+  path?: string;
   isDir: boolean;
+  displayName?: string;
+  displayPath?: string;
 }
 
 export interface DroppedItem {
   kind: "workspace" | "attachment";
   path: string;
   isDir?: boolean;
+  displayPath?: string;
   previewUrl?: string;
 }
 
@@ -486,19 +629,23 @@ export interface ServerView {
   name: string;
   transport: string;
   status: "connected" | "deferred" | "failed" | "initializing" | "disabled";
+  startIntent?: "off" | "automatic" | string;
+  runtimeState?: "idle" | "connecting" | "ready" | "issue" | string;
   builtIn?: boolean;
   configured?: boolean;
   autoStart: boolean;
-  tier?: "lazy" | "background" | "eager" | string;
+  tier?: "background" | "eager" | string;
   command?: string;
   args?: string[];
   url?: string;
   envKeys?: string[];
+  headerKeys?: string[];
   tools: number;
   prompts: number;
   resources: number;
   error?: string;
   toolList?: MCPToolView[];
+  trustedReadOnlyTools?: string[];
   authStatus?: "none" | "possible" | "required" | string;
   authUrl?: string;
   authConfigured?: boolean;
@@ -506,6 +653,7 @@ export interface ServerView {
 export interface MCPToolView {
   name: string;
   description: string;
+  readOnlyHint?: boolean;
 }
 export interface SkillView {
   name: string;
@@ -547,6 +695,8 @@ export interface MCPServerInput {
   args: string[];
   url: string;
   env?: Record<string, string> | null;
+  headers?: Record<string, string> | null;
+  trustedReadOnlyTools?: string[];
 }
 
 export interface ModelInfo {
@@ -650,12 +800,14 @@ export interface ProviderView {
   added: boolean;
   kind: string;
   baseUrl: string;
+  chatUrl?: string; // optional full chat completions URL; empty derives from baseUrl
   models: string[];
   visionModels: string[]; // subset of models that accepts image input
   visionModelsConfigured: boolean; // true when an empty list is an explicit choice
   modelsUrl: string; // optional override for model discovery; empty derives from baseUrl
   default: string;
   apiKeyEnv: string;
+  headers?: Record<string, string> | null; // optional extra request headers for compatible gateways
   keySet: boolean; // the env var currently resolves to a value
   requiresKey?: boolean; // false for explicit no-auth providers
   configured?: boolean; // selectable: key is set or no key is required
@@ -666,6 +818,15 @@ export interface ProviderView {
   reasoningProtocol: string; // auto|deepseek|openai|none; empty = auto/model registry
   supportedEfforts: string[]; // custom /effort levels; empty = use built-in Kind/BaseURL default
   defaultEffort: string; // /effort level when user picks "auto" or unset; "" = supportedEfforts[0]
+  modelOverrides?: ProviderModelOverrideView[] | null;
+}
+
+export interface ProviderModelOverrideView {
+  model: string;
+  reasoningProtocol: string;
+  supportedEfforts: string[];
+  defaultEffort: string;
+  vision?: boolean | null;
 }
 
 // BalanceInfo is the wallet-balance readout (desktop/app.go Balance). available
@@ -888,20 +1049,34 @@ export interface SettingsView {
   agent: AgentView;
   bot: BotSettingsView;
   desktopLanguage: string; // "" | "en" | "zh"; empty = auto
-  desktopLayoutStyle: string; // "classic" | "workbench"
+  desktopLayoutStyle: string; // "classic" | "workbench" | "creation"
   desktopTheme: string; // "auto" | "dark" | "light"
   desktopThemeStyle: string;
   closeBehavior: string; // "background" | "quit"
   displayMode: string;   // "standard" | "compact"
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
+  defaultToolApprovalMode: ToolApprovalMode | string; // default for newly-created sessions
   checkUpdates: boolean; // check for new versions on startup
   telemetry: boolean; // anonymous launch ping (install id + version + OS)
   metrics: boolean; // aggregate desktop metrics (anonymous signal/bucket counts)
+  memoryCompilerEnabled: boolean; // Memory v5 execution compiler
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   autoApproveTools: boolean;
   bypass: boolean; // legacy JSON key for live YOLO/full-access tool auto-approval
+}
+
+export interface DesktopStartupSettingsView {
+  bot: BotSettingsView;
+  desktopLanguage: string; // "" | "en" | "zh"; empty = auto
+  desktopLayoutStyle: string; // "classic" | "workbench"
+  desktopTheme: string; // "auto" | "dark" | "light"
+  desktopThemeStyle: string;
+  displayMode: string;   // "standard" | "compact"
+  statusBarStyle: string; // "icon" | "text"
+  statusBarItems: string[]; // ordered visible status bar item ids
+  checkUpdates: boolean; // check for new versions on startup
 }
 
 // Auto-updater payloads (desktop/updater.go). UpdateInfo drives the update banner;

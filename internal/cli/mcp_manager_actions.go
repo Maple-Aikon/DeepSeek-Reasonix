@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -163,7 +164,7 @@ func (m chatTUI) applyMCPMode(tier string) (tea.Model, tea.Cmd) {
 	if m.mcpDisabled != nil {
 		delete(m.mcpDisabled, v.Name)
 	}
-	if tier != "lazy" && m.ctrl != nil && !mcpConnected(m.ctrl, v.Name) {
+	if m.ctrl != nil && !mcpConnected(m.ctrl, v.Name) {
 		if _, err := m.ctrl.ConnectConfiguredMCPServer(v.Name); err != nil {
 			recordMCPModePluginFailure(m.ctrl, selected, err)
 			m.notice("saved connection mode, but connect failed: " + err.Error())
@@ -179,7 +180,7 @@ func (m chatTUI) applyMCPMode(tier string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func recordMCPModePluginFailure(ctrl *control.Controller, e config.PluginEntry, err error) {
+func recordMCPModePluginFailure(ctrl control.Capabilities, e config.PluginEntry, err error) {
 	if ctrl == nil || ctrl.Host() == nil || err == nil {
 		return
 	}
@@ -290,12 +291,12 @@ func normalizeMCPTierForCLI(tier string) string {
 	switch strings.ToLower(strings.TrimSpace(tier)) {
 	case "eager":
 		return "eager"
-	case "background":
+	case "background", "lazy":
 		return "background"
 	case "":
 		return "background"
 	default:
-		return "lazy"
+		return "background"
 	}
 }
 
@@ -324,14 +325,22 @@ func mcpEditConfigLaunchCommand(path string, lookPath func(string) (string, erro
 		return mcpEditConfigLaunch{}, fmt.Errorf("no config path available")
 	}
 	if editor := strings.TrimSpace(os.Getenv("VISUAL")); editor != "" {
+		cmd, err := editorLaunchCmd(editor, path)
+		if err != nil {
+			return mcpEditConfigLaunch{}, err
+		}
 		return mcpEditConfigLaunch{
-			cmd:    exec.Command("sh", "-lc", editor+" "+shellQuote(path)),
+			cmd:    cmd,
 			editor: mcpEditorDisplayName(editor),
 		}, nil
 	}
 	if editor := strings.TrimSpace(os.Getenv("EDITOR")); editor != "" {
+		cmd, err := editorLaunchCmd(editor, path)
+		if err != nil {
+			return mcpEditConfigLaunch{}, err
+		}
 		return mcpEditConfigLaunch{
-			cmd:    exec.Command("sh", "-lc", editor+" "+shellQuote(path)),
+			cmd:    cmd,
 			editor: mcpEditorDisplayName(editor),
 		}, nil
 	}
@@ -354,8 +363,8 @@ func mcpEditConfigLaunchCommand(path string, lookPath func(string) (string, erro
 }
 
 func mcpEditorDisplayName(editor string) string {
-	fields := strings.Fields(editor)
-	if len(fields) == 0 {
+	fields, err := splitEditorCommand(os.ExpandEnv(editor))
+	if err != nil || len(fields) == 0 {
 		return ""
 	}
 	return fields[0]
@@ -405,7 +414,7 @@ func mcpCanClearAuth(v mcpServerView) bool {
 	return mcpdiag.IsRemoteTransport(v.Transport)
 }
 
-func mcpConnected(ctrl *control.Controller, name string) bool {
+func mcpConnected(ctrl control.Capabilities, name string) bool {
 	if ctrl == nil || ctrl.Host() == nil {
 		return false
 	}
@@ -417,8 +426,112 @@ func mcpConnected(ctrl *control.Controller, name string) bool {
 	return false
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+// editorLaunchCmd builds an exec.Cmd for an editor invocation read from the
+// VISUAL/EDITOR environment variable. The editor string may carry arguments
+// (e.g. "code --wait", "nvim -p") and shell variable / tilde references
+// (e.g. "$HOME/bin/myeditor", "~/bin/myeditor"); these are expanded without
+// invoking a shell, and the editor binary is resolved by the OS directly.
+// Shell metacharacters in the value cannot be executed: the expanded value is
+// parsed only into argv words, so a value like "vim; rm -rf ~" becomes the
+// literal argv ["vim;", "rm", "-rf", "~/..."] and "vim;" is looked up as the
+// program name (failing harmlessly) rather than being interpreted by a shell.
+//
+// This matches the safe pattern already used by the terminal-editor
+// fallback (exec.Command(bin, path)) in the same function and avoids the
+// previous sh -lc construction that concatenated the raw editor value into
+// a shell command string.
+//
+// Quoting and backslash escaping are honored for word splitting only; shell
+// operators, globbing, command substitution, and redirection are not evaluated.
+// Tilde expansion only covers the leading-token forms "~" and "~/..."; "~user"
+// is not supported (and was not reliably supported by the prior sh -lc path
+// either, since $HOME for another user is not available without getpwuid).
+func editorLaunchCmd(editor, path string) (*exec.Cmd, error) {
+	expanded := os.ExpandEnv(editor)
+	args, err := splitEditorCommand(expanded)
+	if err != nil {
+		return nil, fmt.Errorf("invalid EDITOR/VISUAL value: %w", err)
+	}
+	if len(args) == 0 {
+		return nil, fmt.Errorf("invalid EDITOR/VISUAL value: %q", editor)
+	}
+	args[0] = expandLeadingTilde(args[0])
+	return exec.Command(args[0], append(args[1:], path)...), nil
+}
+
+func splitEditorCommand(s string) ([]string, error) {
+	var args []string
+	var b strings.Builder
+	var quote rune
+	escaped := false
+	escapedQuote := rune(0)
+	inWord := false
+
+	flush := func() {
+		if inWord {
+			args = append(args, b.String())
+			b.Reset()
+			inWord = false
+		}
+	}
+
+	for _, r := range s {
+		switch {
+		case escaped:
+			if escapedQuote == '"' && r != '$' && r != '`' && r != '"' && r != '\\' {
+				b.WriteRune('\\')
+			}
+			b.WriteRune(r)
+			inWord = true
+			escaped = false
+			escapedQuote = 0
+		case r == '\\' && quote != '\'':
+			inWord = true
+			escaped = true
+			escapedQuote = quote
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				b.WriteRune(r)
+			}
+			inWord = true
+		case r == '\'' || r == '"':
+			quote = r
+			inWord = true
+		case unicode.IsSpace(r):
+			flush()
+		default:
+			b.WriteRune(r)
+			inWord = true
+		}
+	}
+	if escaped {
+		b.WriteRune('\\')
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated %q quote", quote)
+	}
+	flush()
+	return args, nil
+}
+
+// expandLeadingTilde replaces a leading "~" or "~/" prefix with the current
+// user's home directory. Other forms (e.g. "~user") are returned unchanged.
+// If the home directory cannot be determined the value is returned as-is so
+// the caller surfaces the exec failure rather than panicking.
+func expandLeadingTilde(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return home + p[1:]
 }
 
 func mcpBoolPtr(v bool) *bool { return &v }

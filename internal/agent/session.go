@@ -17,6 +17,12 @@ type Session struct {
 	mu             sync.RWMutex
 	Messages       []provider.Message
 	rewriteVersion int // bumped each time the log is rewritten (compact/fold)
+	// normalizedDirty is set when LoadSession repaired the history on the way in
+	// (empty tool-call names, dangling calls, truncated args, …). The repair
+	// already lives in Messages, so the next Save persists it automatically as
+	// part of the usual full rewrite; the flag exists for observability and to
+	// let callers opt out of work that a dirty session would make redundant.
+	normalizedDirty bool
 }
 
 // NewSession initializes a session with an optional system prompt.
@@ -70,4 +76,14 @@ func (s *Session) HasContent() bool {
 		}
 	}
 	return false
+}
+
+// HasSystemMessage reports whether the session starts with a system message,
+// which carries the agent's stable identity and behavioural contract. Sessions
+// without one are not safe to persist: when reloaded the model has no identity
+// context and falls back to its training-data defaults.
+func (s *Session) HasSystemMessage() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.Messages) > 0 && s.Messages[0].Role == provider.RoleSystem
 }

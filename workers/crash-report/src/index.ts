@@ -4,21 +4,16 @@
 import { z } from "zod";
 import type { Env } from "./env";
 import { html, redirect } from "./shell";
-import { renderGroup, renderStats, type Group } from "./stats";
-import { renderLogin, renderRegister, renderAccount } from "./auth_pages";
+import { renderGroup, renderStats, type Group, type StatsModule } from "./stats";
+import { renderAccount } from "./auth_pages";
 import { renderUsers, renderAudit, type UserRow, type AuditRow } from "./admin";
 import {
   atLeast,
-  createSession,
   currentUser,
-  endSession,
-  hashPassword,
-  isAdminEmail,
+  loginUrl,
   logAction,
   sameOrigin,
-  sessionCookie,
-  clearCookie,
-  verifyPassword,
+  sharedLogout,
   type Role,
   type User,
 } from "./auth";
@@ -245,12 +240,37 @@ export function crashTitle(message: string): string {
   return head.slice(0, 200);
 }
 
+type SeverityInput = {
+  kind: string;
+  source: string;
+  label: string;
+  errorType: string;
+  errorMessage: string;
+  topFrame: string;
+};
+
+export function isOpaqueScriptErrorReport(input: SeverityInput): boolean {
+  return (
+    input.kind === "crash" &&
+    input.source === "frontend.global" &&
+    input.label === "window.error" &&
+    input.errorType === "string" &&
+    input.errorMessage.trim() === "Script error." &&
+    input.topFrame.trim() === ""
+  );
+}
+
 function severityForKind(kind: string): string {
   if (kind === "crash") return "high";
   if (kind === "performance") return "medium";
   if (kind === "bot") return "medium";
   if (kind === "exception") return "medium";
   return "low";
+}
+
+export function severityForReport(input: SeverityInput): string {
+  if (isOpaqueScriptErrorReport(input)) return "low";
+  return severityForKind(input.kind);
 }
 
 async function sha256Hex(s: string): Promise<string> {
@@ -308,7 +328,7 @@ async function handleReport(request: Request, env: Env): Promise<Response> {
   const errorType = r.errorType ?? "";
   const buildCommit = r.buildCommit ?? "";
   const channel = r.channel ?? "";
-  const severity = severityForKind(r.kind);
+  const severity = severityForReport({ kind: r.kind, source, label, errorType, errorMessage, topFrame });
   const prior = await env.DB.prepare("SELECT status FROM groups WHERE fingerprint = ?1")
     .bind(fingerprint)
     .first<{ status: string }>();
@@ -447,16 +467,6 @@ async function handleMetrics(request: Request, env: Env): Promise<Response> {
   return new Response("ok", { status: 202 });
 }
 
-const Credentials = z.object({
-  email: z.string().email().max(254),
-  password: z.string().min(8).max(200),
-});
-
-const PasswordChange = z.object({
-  current: z.string().min(1).max(200),
-  next: z.string().min(8).max(200),
-});
-
 const UserAction = z.object({
   action: z.enum(["role", "delete"]),
   userId: z.coerce.number().int().positive(),
@@ -478,62 +488,6 @@ async function formObject(request: Request): Promise<Record<string, string>> {
   return out;
 }
 
-async function handleRegister(request: Request, env: Env): Promise<Response> {
-  if (!sameOrigin(request)) return new Response("forbidden", { status: 403 });
-  const parsed = Credentials.safeParse(await formObject(request));
-  if (!parsed.success)
-    return html(renderRegister({ kind: "err", text: "Enter a valid email and a password of at least 8 characters." }));
-  const email = parsed.data.email.toLowerCase();
-
-  const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
-  if (existing) return html(renderRegister({ kind: "err", text: "That email is already registered — try signing in." }));
-
-  const role: Role = isAdminEmail(env, email) ? "admin" : "pending";
-  const now = new Date().toISOString();
-  const hash = await hashPassword(parsed.data.password);
-  const res = await env.DB.prepare(
-    "INSERT INTO users (email, password_hash, role, created_at, approved_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-  )
-    .bind(email, hash, role, now, role === "admin" ? now : null)
-    .run();
-
-  const token = await createSession(env, res.meta.last_row_id);
-  return redirect(role === "pending" ? "/account" : "/stats", sessionCookie(token));
-}
-
-async function handleLogin(request: Request, env: Env): Promise<Response> {
-  if (!sameOrigin(request)) return new Response("forbidden", { status: 403 });
-  const parsed = Credentials.safeParse(await formObject(request));
-  if (!parsed.success) return html(renderLogin({ kind: "err", text: "Enter a valid email and password." }));
-  const email = parsed.data.email.toLowerCase();
-
-  const row = await env.DB.prepare("SELECT id, password_hash, role FROM users WHERE email = ?1")
-    .bind(email)
-    .first<{ id: number; password_hash: string; role: Role }>();
-  const ok = row ? await verifyPassword(parsed.data.password, row.password_hash) : false;
-  if (!row || !ok) return html(renderLogin({ kind: "err", text: "Wrong email or password." }));
-
-  const token = await createSession(env, row.id);
-  return redirect(atLeast(row.role, "viewer") ? "/stats" : "/account", sessionCookie(token));
-}
-
-async function handleAccountPassword(request: Request, env: Env, user: User): Promise<Response> {
-  if (!sameOrigin(request)) return new Response("forbidden", { status: 403 });
-  const parsed = PasswordChange.safeParse(await formObject(request));
-  if (!parsed.success) return html(renderAccount(user, { kind: "err", text: "New password must be at least 8 characters." }));
-
-  const row = await env.DB.prepare("SELECT password_hash FROM users WHERE id = ?1")
-    .bind(user.id)
-    .first<{ password_hash: string }>();
-  if (!row || !(await verifyPassword(parsed.data.current, row.password_hash)))
-    return html(renderAccount(user, { kind: "err", text: "Current password is incorrect." }));
-
-  await env.DB.prepare("UPDATE users SET password_hash = ?1 WHERE id = ?2")
-    .bind(await hashPassword(parsed.data.next), user.id)
-    .run();
-  return html(renderAccount(user, { kind: "ok", text: "Password updated." }));
-}
-
 type StatsFilters = {
   status: string;
   source: string;
@@ -542,10 +496,13 @@ type StatsFilters = {
   platform: string;
   newLatest: boolean;
   regressed: boolean;
+  windowDays: 7 | 30;
+  preferenceMode: "users" | "opens";
 };
 
 function statsFilters(url: URL): StatsFilters {
   const status = url.searchParams.get("status") ?? "";
+  const windowParam = url.searchParams.get("window") ?? "";
   return {
     status: ["open", "resolved", "ignored"].includes(status) ? status : "",
     source: (url.searchParams.get("source") ?? "").slice(0, 32),
@@ -554,6 +511,8 @@ function statsFilters(url: URL): StatsFilters {
     platform: (url.searchParams.get("platform") ?? "").slice(0, 80),
     newLatest: url.searchParams.get("new") === "latest",
     regressed: url.searchParams.get("regressed") === "1",
+    windowDays: windowParam === "7d" ? 7 : 30,
+    preferenceMode: url.searchParams.get("prefs") === "opens" ? "opens" : "users",
   };
 }
 
@@ -571,10 +530,22 @@ async function crashGroups(env: Env, filters: StatsFilters, latestVersion: strin
   if (filters.platform) add("last_os || ' ' || last_arch = ?", filters.platform);
   if (filters.newLatest && latestVersion) add("first_version = ?", latestVersion);
   if (filters.regressed) where.push("regressed_at <> ''");
+  let latestOrder = "";
+  if (latestVersion) {
+    latestOrder = `CASE WHEN first_version = ?${binds.length + 1} THEN 0 ELSE 1 END,`;
+    binds.push(latestVersion);
+  }
   const sql = `SELECT fingerprint, kind, count, first_version, last_version, substr(last_seen, 1, 10) AS seen,
       status, title, source, label, error_type, top_frame, severity, last_os, last_arch, regressed_at
     FROM groups ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-    ORDER BY last_seen DESC LIMIT 50`;
+    ORDER BY
+      CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+      CASE WHEN regressed_at <> '' THEN 0 ELSE 1 END,
+      ${latestOrder}
+      CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+      count DESC,
+      last_seen DESC
+    LIMIT 50`;
   const stmt = env.DB.prepare(sql);
   const query = binds.length ? stmt.bind(...binds) : stmt;
   return query.all<{
@@ -641,10 +612,88 @@ async function latestObservedVersion(env: Env): Promise<string> {
   return newestReleaseVersion(rows.results.map((r) => r.version));
 }
 
-async function metricUserRows(env: Env): Promise<{ signal: string; bucket: string; total: number }[]> {
+type OverviewCounts = {
+  latestAdoptionPct: number | null;
+  openReports: number;
+  newLatestReports: number;
+  regressedReports: number;
+  criticalOpenReports: number;
+};
+
+async function latestAdoptionPct(env: Env, latestVersion: string, days: 7 | 30): Promise<number | null> {
+  if (!latestVersion) return null;
+  const row = await env.DB.prepare(
+    `SELECT
+      COUNT(DISTINCT install_id) AS total_installs,
+      COUNT(DISTINCT CASE WHEN version = ?1 THEN install_id END) AS latest_installs
+    FROM pings WHERE date >= date('now', '${currentWindowSince(days)}')`,
+  )
+    .bind(latestVersion)
+    .first<{ total_installs: number; latest_installs: number }>();
+  const total = Number(row?.total_installs ?? 0);
+  if (!total) return null;
+  return (Number(row?.latest_installs ?? 0) / total) * 100;
+}
+
+async function diagnosticOverview(env: Env, latestVersion: string, days: 7 | 30): Promise<OverviewCounts> {
+  const diagnosticCounts = latestVersion
+    ? env.DB.prepare(
+        `SELECT
+          SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_reports,
+          SUM(CASE WHEN first_version = ?1 THEN 1 ELSE 0 END) AS new_latest_reports,
+          SUM(CASE WHEN regressed_at <> '' THEN 1 ELSE 0 END) AS regressed_reports,
+          SUM(CASE WHEN status = 'open' AND severity IN ('critical', 'high') THEN 1 ELSE 0 END) AS critical_open_reports
+        FROM groups`,
+      )
+        .bind(latestVersion)
+        .first<{ open_reports: number; new_latest_reports: number; regressed_reports: number; critical_open_reports: number }>()
+    : env.DB.prepare(
+        `SELECT
+          SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_reports,
+          0 AS new_latest_reports,
+          SUM(CASE WHEN regressed_at <> '' THEN 1 ELSE 0 END) AS regressed_reports,
+          SUM(CASE WHEN status = 'open' AND severity IN ('critical', 'high') THEN 1 ELSE 0 END) AS critical_open_reports
+        FROM groups`,
+      ).first<{ open_reports: number; new_latest_reports: number; regressed_reports: number; critical_open_reports: number }>();
+  const [row, adoptionPct] = await Promise.all([
+    diagnosticCounts,
+    latestAdoptionPct(env, latestVersion, days),
+  ]);
+  return {
+    latestAdoptionPct: adoptionPct,
+    openReports: Number(row?.open_reports ?? 0),
+    newLatestReports: Number(row?.new_latest_reports ?? 0),
+    regressedReports: Number(row?.regressed_reports ?? 0),
+    criticalOpenReports: Number(row?.critical_open_reports ?? 0),
+  };
+}
+
+function currentWindowSince(days: 7 | 30): string {
+  return `-${days - 1} day`;
+}
+
+function previousWindowSince(days: 7 | 30): string {
+  return `-${days * 2 - 1} day`;
+}
+
+function previousWindowUntil(days: 7 | 30): string {
+  return currentWindowSince(days);
+}
+
+async function metricRows(env: Env, days: 7 | 30, previous = false): Promise<{ signal: string; bucket: string; total: number }[]> {
+  const where = previous
+    ? `date >= date('now', '${previousWindowSince(days)}') AND date < date('now', '${previousWindowUntil(days)}')`
+    : `date >= date('now', '${currentWindowSince(days)}')`;
+  const rows = await env.DB.prepare(
+    `SELECT signal, bucket, SUM(count) AS total FROM metrics WHERE ${where} GROUP BY signal, bucket ORDER BY signal, total DESC`,
+  ).all<{ signal: string; bucket: string; total: number }>();
+  return rows.results;
+}
+
+async function metricUserRows(env: Env, days: 7 | 30): Promise<{ signal: string; bucket: string; total: number }[]> {
   try {
     const rows = await env.DB.prepare(
-      "SELECT signal, bucket, COUNT(*) AS total FROM metric_users WHERE date >= date('now', '-6 day') GROUP BY signal, bucket ORDER BY signal, total DESC",
+      `SELECT signal, bucket, COUNT(DISTINCT install_id) AS total FROM metric_users WHERE date >= date('now', '${currentWindowSince(days)}') GROUP BY signal, bucket ORDER BY signal, total DESC`,
     ).all<{ signal: string; bucket: string; total: number }>();
     return rows.results;
   } catch (err) {
@@ -653,26 +702,27 @@ async function metricUserRows(env: Env): Promise<{ signal: string; bucket: strin
   }
 }
 
-async function handleStats(request: Request, env: Env, user: User): Promise<Response> {
+async function handleStats(request: Request, env: Env, user: User, activeModule: StatsModule): Promise<Response> {
   const url = new URL(request.url);
   const filters = statsFilters(url);
   const latestVersion = await latestObservedVersion(env);
-  const [daily, versions, platforms, crashes, metrics, metricUsers, sources] = await Promise.all([
+  const days = filters.windowDays;
+  const [daily, versions, platforms, crashes, metrics, previousMetrics, metricUsers, sources, overview] = await Promise.all([
     env.DB.prepare(
-      "SELECT date, COUNT(*) AS users, SUM(opens) AS opens FROM pings WHERE date >= date('now', '-29 day') GROUP BY date",
+      `SELECT date, COUNT(*) AS users, SUM(opens) AS opens FROM pings WHERE date >= date('now', '${currentWindowSince(days)}') GROUP BY date`,
     ).all<{ date: string; users: number; opens: number }>(),
     env.DB.prepare(
-      "SELECT version AS label, COUNT(DISTINCT install_id) AS users FROM pings WHERE date >= date('now', '-6 day') GROUP BY label ORDER BY users DESC LIMIT 15",
+      `SELECT version AS label, COUNT(DISTINCT install_id) AS users FROM pings WHERE date >= date('now', '${currentWindowSince(days)}') GROUP BY label ORDER BY users DESC LIMIT 15`,
     ).all<{ label: string; users: number }>(),
     env.DB.prepare(
-      "SELECT os || ' ' || arch AS label, COUNT(DISTINCT install_id) AS users FROM pings WHERE date >= date('now', '-6 day') GROUP BY label ORDER BY users DESC",
+      `SELECT os || ' ' || arch AS label, COUNT(DISTINCT install_id) AS users FROM pings WHERE date >= date('now', '${currentWindowSince(days)}') GROUP BY label ORDER BY users DESC`,
     ).all<{ label: string; users: number }>(),
     crashGroups(env, filters, latestVersion),
-    env.DB.prepare(
-      "SELECT signal, bucket, SUM(count) AS total FROM metrics WHERE date >= date('now', '-6 day') GROUP BY signal, bucket ORDER BY signal, total DESC",
-    ).all<{ signal: string; bucket: string; total: number }>(),
-    metricUserRows(env),
+    metricRows(env, days),
+    metricRows(env, days, true),
+    metricUserRows(env, days),
     env.DB.prepare("SELECT source AS label, COUNT(*) AS users FROM groups GROUP BY source ORDER BY users DESC").all<{ label: string; users: number }>(),
+    diagnosticOverview(env, latestVersion, days),
   ]);
   return html(
     renderStats(
@@ -681,13 +731,16 @@ async function handleStats(request: Request, env: Env, user: User): Promise<Resp
         versions: versions.results,
         platforms: platforms.results,
         crashes: crashes.results,
-        metrics: metrics.results,
+        metrics,
+        previousMetrics,
         metricUsers,
         sources: sources.results,
+        overview,
         latestVersion,
         filters,
       },
       user,
+      activeModule,
     ),
   );
 }
@@ -775,24 +828,21 @@ async function handleAdminUsers(request: Request, env: Env, admin: User): Promis
   const a = parsed.data;
   if (a.userId === admin.id) return redirect("/admin");
 
-  const target = await env.DB.prepare("SELECT email, role FROM users WHERE id = ?1")
+  const target = await env.DB.prepare("SELECT email, role FROM access WHERE id = ?1")
     .bind(a.userId)
     .first<{ email: string; role: Role }>();
   if (!target) return redirect("/admin");
 
   if (a.action === "delete") {
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM sessions WHERE user_id = ?1").bind(a.userId),
-      env.DB.prepare("DELETE FROM users WHERE id = ?1").bind(a.userId),
-    ]);
+    await env.DB.prepare("DELETE FROM access WHERE id = ?1").bind(a.userId).run();
     await logAction(env, admin, "delete_user", target.email);
     return redirect("/admin");
   }
 
   const role: Role = a.role ?? "pending";
   const now = new Date().toISOString();
-  await env.DB.prepare("UPDATE users SET role = ?1, approved_at = ?2, approved_by = ?3 WHERE id = ?4")
-    .bind(role, role === "pending" ? null : now, admin.id, a.userId)
+  await env.DB.prepare("UPDATE access SET role = ?1, approved_at = ?2, approved_by = ?3 WHERE id = ?4")
+    .bind(role, role === "pending" ? null : now, admin.email, a.userId)
     .run();
   await logAction(env, admin, "set_role", target.email, `${target.role} → ${role}`);
   return redirect("/admin");
@@ -800,7 +850,7 @@ async function handleAdminUsers(request: Request, env: Env, admin: User): Promis
 
 async function handleAdminList(env: Env, admin: User): Promise<Response> {
   const users = await env.DB.prepare(
-    "SELECT id, email, role, created_at, approved_at FROM users ORDER BY (role = 'pending') DESC, created_at DESC",
+    "SELECT id, email, role, created_at, approved_at FROM access ORDER BY (role = 'pending') DESC, created_at DESC",
   ).all<UserRow>();
   return html(renderUsers(admin, users.results));
 }
@@ -812,8 +862,8 @@ async function handleAdminAudit(env: Env, admin: User): Promise<Response> {
   return html(renderAudit(admin, rows.results));
 }
 
-function requireViewer(user: User | null): Response | null {
-  if (!user) return redirect("/login");
+function requireViewer(user: User | null, login: string): Response | null {
+  if (!user) return redirect(login);
   if (!atLeast(user.role, "viewer")) return redirect("/account");
   return null;
 }
@@ -828,38 +878,34 @@ export default {
     if (path === "/v1/ping" && method === "POST") return handlePing(request, env);
     if (path === "/v1/metrics" && method === "POST") return handleMetrics(request, env);
 
-    if (path === "/register" && method === "GET") return html(renderRegister());
-    if (path === "/register" && method === "POST") return handleRegister(request, env);
-    if (path === "/login" && method === "GET") return html(renderLogin());
-    if (path === "/login" && method === "POST") return handleLogin(request, env);
-    if (path === "/logout" && method === "POST") {
-      await endSession(request, env);
-      return redirect("/login", clearCookie());
-    }
+    const login = loginUrl(env, request);
+
+    // Authentication moved to id.reasonix.io; these paths just bounce there.
+    if ((path === "/login" || path === "/register") && method === "GET") return redirect(login);
+    if (path === "/logout" && method === "POST") return redirect(login, await sharedLogout(request, env));
 
     const user = await currentUser(request, env);
 
-    if (path === "/") return redirect(user ? (atLeast(user.role, "viewer") ? "/stats" : "/account") : "/login");
+    if (path === "/") return redirect(user ? (atLeast(user.role, "viewer") ? "/stats" : "/account") : login);
 
-    if (path === "/account" && method === "GET")
-      return user ? html(renderAccount(user)) : redirect("/login");
-    if (path === "/account/password" && method === "POST")
-      return user ? handleAccountPassword(request, env, user) : redirect("/login");
+    if (path === "/account" && method === "GET") return user ? html(renderAccount(user)) : redirect(login);
 
     const groupMatch = path.match(/^\/stats\/group\/([0-9a-f]{64})$/);
-    if (path === "/stats" && method === "GET") return requireViewer(user) ?? handleStats(request, env, user as User);
-    if (groupMatch && method === "GET") return requireViewer(user) ?? handleGroup(env, groupMatch[1], user as User);
+    const statsModuleMatch = path.match(/^\/stats\/(diagnostics|usage|preferences|health)$/);
+    if ((path === "/stats" || statsModuleMatch) && method === "GET")
+      return requireViewer(user, login) ?? handleStats(request, env, user as User, (statsModuleMatch?.[1] as StatsModule | undefined) ?? "usage");
+    if (groupMatch && method === "GET") return requireViewer(user, login) ?? handleGroup(env, groupMatch[1], user as User);
     if (groupMatch && method === "POST") {
       if (user?.role !== "admin") return new Response("forbidden", { status: 403 });
       return handleGroupAction(request, env, user, groupMatch[1]);
     }
 
     if (path === "/admin" && method === "GET") {
-      if (!user) return redirect("/login");
+      if (!user) return redirect(login);
       return user.role === "admin" ? handleAdminList(env, user) : redirect("/account");
     }
     if (path === "/admin/audit" && method === "GET") {
-      if (!user) return redirect("/login");
+      if (!user) return redirect(login);
       return user.role === "admin" ? handleAdminAudit(env, user) : redirect("/account");
     }
     if (path === "/admin/users" && method === "POST") {
@@ -875,7 +921,6 @@ export default {
       path === "/register" ||
       path === "/logout" ||
       path === "/account" ||
-      path === "/account/password" ||
       path.startsWith("/stats") ||
       path.startsWith("/admin")
     ) {

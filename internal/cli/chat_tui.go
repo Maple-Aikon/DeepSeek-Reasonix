@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,7 +18,6 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
 
 	"reasonix/internal/agent"
@@ -41,18 +39,18 @@ import (
 )
 
 // chatTUI is a bubbletea Model that normally owns the terminal with an
-// alt-screen transcript viewport. Termux is the exception: enabling mouse mode
-// prevents taps from raising the soft keyboard, so it stays in the normal buffer
-// and commits finalized output to native scrollback via tea.Println.
+// alt-screen transcript viewport. Termux is the exception: it stays in the
+// normal buffer and commits finalized output to native scrollback via
+// tea.Println so taps can still focus the soft keyboard.
 type chatTUI struct {
-	ctrl    *control.Controller
+	ctrl    control.SessionAPI
 	label   string
 	missing string // missing-key warning surfaced once in the banner, "" when ready
 
 	width  int
 	height int
-	// nativeScrollback keeps Termux out of alt-screen/mouse mode so taps still
-	// focus the textarea and raise the soft keyboard.
+	// nativeScrollback keeps Termux out of alt-screen mode so taps still focus
+	// the textarea and raise the soft keyboard.
 	nativeScrollback bool
 
 	input   textarea.Model
@@ -90,6 +88,10 @@ type chatTUI struct {
 	// marker rides in outgoing user messages so the cache-stable prompt prefix is
 	// left untouched.
 	planMode bool
+	// sessionSwitch is set by replayActiveBranch to suppress the ClearScreen
+	// flicker when the viewport content is completely rebuilt during a session
+	// switch (#5441). Cleared after one Update cycle.
+	sessionSwitch bool
 	// yoloRestoreToolApprovalMode remembers the Ask/Auto base mode that Ctrl+Y
 	// should restore after a desktop-style YOLO toggle.
 	yoloRestoreToolApprovalMode string
@@ -189,6 +191,11 @@ type chatTUI struct {
 	// column the drag is held at, so the ticker can extend the selection head.
 	autoScroll int
 	dragX      int
+	// scrollbarDrag owns left-button drags that start on the transcript scrollbar
+	// column. It is separate from text selection so the visual thumb is not a
+	// dead target and dragging it never leaves a transcript selection behind.
+	scrollbarDrag       bool
+	scrollbarGrabOffset int
 
 	// The user bubble is echoed to scrollback immediately on Enter (bubbleStartIdx
 	// marks where in the transcript it landed). It stays "un-sendable" until the
@@ -219,6 +226,7 @@ type chatTUI struct {
 	// resumePick is the interactive "/resume" session picker overlay. Non-nil
 	// while the user browses saved sessions with ↑/↓ and confirms with Enter.
 	resumePick *resumePicker
+	copyPick   *copyPicker
 	lastEsc    time.Time
 
 	// mcp is the interactive "/mcp" manager overlay. mcpDisabled tracks servers
@@ -298,7 +306,7 @@ type chatTUI struct {
 	// and kills plugin subprocesses, both of which corrupt the terminal's
 	// raw mode). Instead they are closed at process exit when the terminal
 	// is already being restored.
-	oldControllers []*control.Controller
+	oldControllers []control.SessionAPI
 
 	// completion is the live autocomplete menu (slash commands; @-refs later).
 	completion completion
@@ -320,6 +328,16 @@ type agentEventMsg event.Event
 // maxEventDrain caps how many buffered events one Update coalesces before
 // yielding to render, so a sustained output flood still shows live progress.
 const maxEventDrain = 512
+
+const resetMouseTracking = ansi.ResetModeMouseX10 +
+	ansi.ResetModeMouseNormal +
+	ansi.ResetModeMouseHighlight +
+	ansi.ResetModeMouseButtonEvent +
+	ansi.ResetModeMouseAnyEvent +
+	ansi.ResetModeMouseExtSgr +
+	ansi.ResetModeMouseExtUtf8 +
+	ansi.ResetModeMouseExtUrxvt +
+	ansi.ResetModeMouseExtSgrPixel
 
 // compactDoneMsg reports that an async /compact pass returned. The card was
 // already drawn from the CompactionDone event; this only surfaces a failure and
@@ -394,8 +412,8 @@ func (m chatTUI) refreshGitStatus() tea.Cmd {
 // mode that would occur if Close() were called from the build goroutine.
 type modelSwitchMsg struct {
 	ref      string
-	ctrl     *control.Controller
-	oldCtrl  *control.Controller
+	ctrl     control.SessionAPI
+	oldCtrl  control.SessionAPI
 	label    string
 	commands []command.Command
 	skills   []skill.Skill
@@ -406,7 +424,7 @@ type modelSwitchMsg struct {
 // fetchBalance queries the provider's wallet balance off the event loop. It's a
 // no-op readout ("") when the provider declares no balance_url or the fetch
 // fails, so the status line stays quiet rather than surfacing an error.
-func fetchBalance(ctrl *control.Controller) tea.Cmd {
+func fetchBalance(ctrl control.Status) tea.Cmd {
 	return func() tea.Msg {
 		b, err := ctrl.Balance(context.Background())
 		if err != nil || b == nil {
@@ -450,7 +468,7 @@ type clipboardPasteMsg struct {
 // with an event sink that feeds eventCh; the TUI issues commands to it and
 // renders the events it emits. Label, history, host, and commands are read from
 // the controller, so a resumed session pre-populates scrollback.
-func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Event, termW int) chatTUI {
+func newChatTUI(ctrl control.SessionAPI, missing string, eventCh chan event.Event, termW int) chatTUI {
 	ti := textarea.New()
 	configureChatTextarea(&ti)
 
@@ -460,6 +478,7 @@ func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Eve
 
 	commitBuf := []string{}
 	nativeScrollback := detectTermuxTerminal()
+	renderW := transcriptContentWidth(termW, nativeScrollback)
 	return chatTUI{
 		ctrl:                 ctrl,
 		label:                ctrl.Label(),
@@ -477,7 +496,7 @@ func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Eve
 		reasoning:            &strings.Builder{},
 		pending:              &strings.Builder{},
 		pendingCommit:        &commitBuf,
-		renderer:             newMarkdownRenderer(termW),
+		renderer:             newMarkdownRenderer(renderW),
 		diffMaxLines:         diffFoldLimit,
 		showReasoning:        nativeScrollback,
 		shellOutputs:         make(map[string]string),
@@ -492,6 +511,13 @@ func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Eve
 		viewport:             viewport.New(viewport.WithWidth(termW)),
 		statusLineCount:      2,
 	}
+}
+
+func transcriptContentWidth(termW int, nativeScrollback bool) int {
+	if !nativeScrollback {
+		termW-- // reserve the last column for the transcript scrollbar
+	}
+	return max(termW, 1)
 }
 
 func configureChatTextarea(ti *textarea.Model) {
@@ -659,6 +685,10 @@ func (m chatTUI) Init() tea.Cmd {
 	)
 }
 
+func suspendWithMouseReset() tea.Cmd {
+	return tea.Sequence(tea.Raw(resetMouseTracking), tea.Suspend)
+}
+
 func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	wasAtBottom := m.viewport.AtBottom()
 	prevLines := len(m.transcript)
@@ -668,14 +698,7 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	cm := next.(chatTUI)
 
-	contentW := cm.width - 1 // last column is the scrollbar
-	if contentW < 1 {
-		contentW = 1
-	}
-	// Recompute the wrapped status-line count so bottomRows reserves the right
-	// height for the viewport. The data-line tags (model, git, effort, context,
-	// cache, jobs, balance) are the ones most likely to wrap on a narrow terminal.
-	cm.statusLineCount = cm.computeStatusLineCount(contentW)
+	contentW := transcriptContentWidth(cm.width, cm.nativeScrollback)
 	cm.viewport.SetWidth(contentW)
 	// Recompute the wrapped status-line count so bottomRows reserves the right
 	// height for the viewport. Use cm.width (same as boxW in View()) so the
@@ -688,19 +711,23 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wrapped := wrapTranscript(strings.Join(cm.transcript, "\n"), contentW)
 		cm.viewport.SetContent(wrapped)
 		cm.wrappedLines = strings.Split(wrapped, "\n")
-		if wasAtBottom || cm.forceGotoBottom {
+		if wasAtBottom {
 			cm.viewport.GotoBottom() // tail-follow: stay pinned to newest output
-			cm.forceGotoBottom = false
 		}
+	}
+	if cm.forceGotoBottom {
+		cm.viewport.GotoBottom()
+		cm.forceGotoBottom = false
 	}
 	cm.transcriptDirty = false
 	// Any viewport scroll (wheel, PgUp/PgDn, edge auto-scroll, or tail-follow to
 	// newest output) shifts the whole window. Some terminals (Warp) mishandle
 	// the renderer's scroll/insert-line optimization and strand stale rows, so
 	// force a full clear+redraw whenever the offset actually moved.
-	if cm.viewport.YOffset() != prevYOff && !cm.nativeScrollback {
+	if cm.viewport.YOffset() != prevYOff && !cm.nativeScrollback && !cm.sessionSwitch {
 		return cm, tea.Batch(tea.ClearScreen, cmd)
 	}
+	cm.sessionSwitch = false
 	return cm, cmd
 }
 
@@ -714,16 +741,17 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.input.SetWidth(msg.Width - 4)
-		m.renderer = newMarkdownRenderer(msg.Width)
+		contentW := transcriptContentWidth(msg.Width, m.nativeScrollback)
+		m.renderer = newMarkdownRenderer(contentW)
 		// Commit the banner — and a resumed session's transcript — once, now
 		// that the width is known.
 		if !m.started {
 			m.started = true
 			var b strings.Builder
-			b.WriteString(renderTUIBanner(m.label, m.missing, msg.Width))
+			b.WriteString(renderTUIBanner(m.label, m.missing, contentW))
 			if len(m.history) > 0 {
-				r := newMarkdownRenderer(msg.Width)
-				for _, sec := range replaySectionsFor(m.history, msg.Width, r) {
+				r := newMarkdownRenderer(contentW)
+				for _, sec := range replaySectionsFor(m.history, contentW, r) {
 					b.WriteString(sec)
 				}
 				m.history = nil
@@ -743,11 +771,19 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseClickMsg:
 		// Right-click copies the active selection (Windows Terminal convention);
 		// left-press in the transcript region begins a text selection — unless
-		// the click lands on a shell-output hint line, which toggles expand.
+		// the click lands on the scrollbar or a shell-output hint line.
 		if msg.Button == tea.MouseRight && m.sel.active && !m.sel.empty() {
 			text := m.selectedText()
 			m.sel = selection{}
 			return m, tea.Batch(copyToClipboard(text), finalize(m, cmds))
+		}
+		if msg.Button == tea.MouseLeft && m.inScrollbar(msg.X, msg.Y) {
+			m.sel = selection{}
+			m.autoScroll = 0
+			m.scrollbarDrag = true
+			m.scrollbarGrabOffset = m.scrollbarGrabRowOffset(msg.Y)
+			m.dragScrollbar(msg.Y)
+			return m, nil
 		}
 		if msg.Button == tea.MouseLeft && msg.Y < m.viewport.Height() {
 			// Check if the clicked line is a shell-output hint.
@@ -766,6 +802,10 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMotionMsg:
+		if m.scrollbarDrag {
+			m.dragScrollbar(msg.Y)
+			return m, nil
+		}
 		// Drag extends the live selection (CellMotion only reports motion while
 		// a button is held, so this is a drag). A drag held against the top or
 		// bottom edge starts an auto-scroll ticker so the selection can run past
@@ -807,6 +847,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Release finalizes the selection; the highlight stays on as the visual
 		// "what's selected" cue and a right-click copies it. A plain click (no
 		// drag) clears any prior selection.
+		if m.scrollbarDrag {
+			m.dragScrollbar(msg.Y)
+			m.scrollbarDrag = false
+			m.scrollbarGrabOffset = 0
+			return m, nil
+		}
 		m.autoScroll = 0 // stop edge auto-scroll
 		if msg.Button == tea.MouseLeft && m.sel.active && m.sel.empty() {
 			m.sel = selection{}
@@ -850,7 +896,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 			return m, finalize(m, cmds)
 		case "ctrl+z":
-			return m, tea.Suspend
+			return m, suspendWithMouseReset()
 		}
 		// A question card is modal: keys drive it. In its free-text ("Type
 		// something") mode, the keystroke goes to the textarea — Enter confirms the
@@ -888,6 +934,10 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The MCP import picker is modal while open: keys select candidates.
 		if m.mcpImport != nil {
 			return m.handleMCPImportKey(msg)
+		}
+		// Copy picker is modal while open.
+		if m.copyPick != nil {
+			return m.handleCopyPickerKey(msg)
 		}
 		// The resume picker is modal while open: keys navigate it.
 		if m.resumePick != nil {
@@ -1017,6 +1067,9 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.bubblePending {
 					m.unsendPending() // server not yet replied — restore text, leave no trace
+				} else if m.cancelRequested() {
+					m.ctrl.Cancel()
+					return m, tea.Quit
 				} else {
 					m.ctrl.Cancel()
 				}
@@ -1052,6 +1105,17 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, finalize(m, nil)
 		case "ctrl+d":
 			return m, tea.Quit
+		case "ctrl+l":
+			if m.state != tuiRunning {
+				m.finalizeStreamed()
+				m.clearTranscriptDisplay()
+				m.commitLine(strings.TrimRight(
+					renderTUIBanner(m.label, "", transcriptContentWidth(m.width, m.nativeScrollback)), "\n"))
+				m.transcriptDirty = true
+				m.forceGotoBottom = true
+				m.notice(i18n.M.SlashClsDone)
+			}
+			return m, finalize(m, cmds)
 		case "ctrl+v", "ctrl+shift+v", "super+v", "meta+v":
 			if m.state == tuiRunning {
 				return m, nil
@@ -1081,12 +1145,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.queueEditCursor >= 0 && m.queueEditCursor < len(m.pendingInterject) {
 					// Save the edited text back to the queue slot.
-					m.pendingInterject[m.queueEditCursor] = line
+					m.pendingInterject[m.queueEditCursor] = m.expandPastedBlocks(line)
 					m.notice(fmt.Sprintf("queue [%d] updated", m.queueEditCursor+1))
 					m.queueEditCursor = -1
 					m.queueEditDraft = ""
 				} else {
-					m.pendingInterject = append(m.pendingInterject, line)
+					m.pendingInterject = append(m.pendingInterject, m.expandPastedBlocks(line))
 					m.notice("feedback queued — will send when the current turn finishes")
 					m.queueEditCursor = -1
 					m.queueEditDraft = ""
@@ -1169,6 +1233,11 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			sentLine := m.expandPastedBlocks(line)
 			m.input.Reset()
+			if goal, ok := m.ctrl.AutoStartResearchGoal(sentLine); ok {
+				m.pastedBlocks = nil
+				cmds = append(cmds, m.startTurnWithRaw("Start pursuing the active goal now.", line, line, goal))
+				return m, finalize(m, cmds)
+			}
 
 			// @references (local files / MCP resources, including inline image
 			// attachments) are resolved off the event loop by the controller; the turn
@@ -1178,7 +1247,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, finalize(m, cmds)
 			}
 
-			cmds = append(cmds, m.startTurnWithRaw(sentLine, sentLine, line, line))
+			// `raw` is the un-resolved user prompt used for auto-plan scoring AND the
+			// memory compiler's source_event. It must be the EXPANDED paste content
+			// (sentLine), not the folded label (line) — otherwise the memory compiler's
+			// execution contract replaces the user turn with one whose source_event is
+			// just the placeholder label, and the model never sees the pasted content.
+			cmds = append(cmds, m.startTurnWithRaw(sentLine, sentLine, line, sentLine))
 			return m, finalize(m, cmds)
 		}
 
@@ -1305,7 +1379,10 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.block != "" {
 			sent = "Referenced context:\n\n" + msg.block + "\n\n" + msg.sent
 		}
-		cmds = append(cmds, m.startTurnWithRaw(sent, msg.display, msg.restore, msg.restore))
+		// raw = msg.display (the expanded paste content, without resolved @-ref
+		// payloads) — NOT msg.restore (the folded label). See the non-refs branch
+		// above for why the memory compiler's source_event needs the expansion.
+		cmds = append(cmds, m.startTurnWithRaw(sent, msg.display, msg.restore, msg.display))
 
 	case clipboardImageMsg:
 		if msg.err != nil {
@@ -1365,8 +1442,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // finalize drains the committed-line queue and batches the turn's commands. In
 // the default alt-screen path the queue is already mirrored in m.transcript. In
-// Termux we cannot enable mouse mode without breaking soft-keyboard focus, so
-// finalized lines are also emitted into the terminal's native scrollback.
+// Termux finalized lines are also emitted into the terminal's native scrollback.
 func finalize(m chatTUI, cmds []tea.Cmd) tea.Cmd {
 	if m.nativeScrollback && len(*m.pendingCommit) > 0 {
 		out := strings.TrimRight(clampWidth(strings.Join(*m.pendingCommit, "\n"), m.width), "\n")
@@ -1380,6 +1456,24 @@ func finalize(m chatTUI, cmds []tea.Cmd) tea.Cmd {
 	}
 	*m.pendingCommit = (*m.pendingCommit)[:0]
 	return tea.Batch(cmds...)
+}
+
+func (m *chatTUI) clearTranscriptDisplay() {
+	if m.pendingCommit != nil {
+		*m.pendingCommit = (*m.pendingCommit)[:0]
+	}
+	m.transcript = nil
+	m.wrappedLines = nil
+	m.viewport.SetContent("")
+	m.shellOutputs = make(map[string]string)
+	m.shellExpanded = make(map[string]bool)
+	m.shellTranscriptIdx = make(map[string]int)
+	m.toolLineCountByID = make(map[string]int)
+	m.toolStreamID = ""
+	m.toolStreamIdx = -1
+	m.toolTail = nil
+	m.toolPartial = ""
+	m.toolLineCount = 0
 }
 
 // scrollChunkHeight is the largest block (in lines) finalize prints at once in
@@ -1462,6 +1556,7 @@ func (m chatTUI) bottomRows() int {
 		m.renderRewind(),
 		m.renderMCPImport(),
 		m.renderResumePicker(),
+		m.renderCopyPicker(),
 		m.renderCompletion(),
 	} {
 		if s != "" {
@@ -1502,7 +1597,7 @@ func (m chatTUI) bottomRows() int {
 // reserve rows for a composer that cannot receive input, leaving a confusing
 // blank/bordered area at the bottom of the TUI.
 func (m chatTUI) hideComposer() bool {
-	if m.mcp != nil || m.clearConfirm != nil || m.mcpImport != nil || m.skillPick != nil || m.resumePick != nil || m.rewind != nil || m.pendingApproval != nil {
+	if m.mcp != nil || m.clearConfirm != nil || m.mcpImport != nil || m.skillPick != nil || m.resumePick != nil || m.copyPick != nil || m.rewind != nil || m.pendingApproval != nil {
 		return true
 	}
 	return m.chooser != nil && !m.chooser.typing
@@ -1860,7 +1955,7 @@ func (m *chatTUI) collapseShellSlot(id string, idx int, resultOutput string) {
 			for i := 0; i < shellPreviewLines; i++ {
 				preview[i] = dim(clampPlain(lines[i], m.width-len([]rune(connector))))
 			}
-			preview[shellPreviewLines] = dim(fmt.Sprintf("… %d more lines (click/Ctrl+B)", total-shellPreviewLines))
+			preview[shellPreviewLines] = dim(fmt.Sprintf("… %d more lines (Ctrl+B)", total-shellPreviewLines))
 			m.transcript[idx] = connectorBlock(preview)
 		} else {
 			rendered := make([]string, total)
@@ -1881,9 +1976,9 @@ func (m *chatTUI) collapseShellSlot(id string, idx int, resultOutput string) {
 func (m *chatTUI) toggleShellOutput() {
 	// Find the most recent shell output that has a transcript entry.
 	var lastID string
-	var lastIdx int
+	lastIdx := -1
 	for id, idx := range m.shellTranscriptIdx {
-		if idx > lastIdx {
+		if idx >= 0 && idx < len(m.transcript) && idx > lastIdx {
 			lastID = id
 			lastIdx = idx
 		}
@@ -1910,7 +2005,7 @@ func (m *chatTUI) toggleShellOutput() {
 			for i := 0; i < shellPreviewLines; i++ {
 				preview[i] = dim(clampPlain(lines[i], innerW))
 			}
-			preview[shellPreviewLines] = dim(fmt.Sprintf("… %d more lines (click/Ctrl+B)", total-shellPreviewLines))
+			preview[shellPreviewLines] = dim(fmt.Sprintf("… %d more lines (Ctrl+B)", total-shellPreviewLines))
 			m.transcript[lastIdx] = connectorBlock(preview)
 		}
 	} else {
@@ -2158,6 +2253,46 @@ var (
 	workingStyle        lipgloss.Style
 )
 
+func (m chatTUI) cancelRequested() bool {
+	if m.state != tuiRunning || m.ctrl == nil {
+		return false
+	}
+	return m.ctrl.CancelRequested()
+}
+
+func (m chatTUI) runningWorkingLine(cancelRequested, styled bool) string {
+	if m.state != tuiRunning {
+		return ""
+	}
+	if m.retryAttempt > 0 && !cancelRequested {
+		return fmt.Sprintf("  "+i18n.M.ChatStatusRetryingFmt, m.spinner.View(), m.retryAttempt, m.retryMax)
+	}
+
+	var working string
+	if cancelRequested {
+		working = fmt.Sprintf("  "+i18n.M.ChatStatusCancellingFmt, m.spinner.View(), m.elapsed)
+	} else {
+		working = fmt.Sprintf("  "+i18n.M.ChatStatusThinkingFmt, m.spinner.View(), m.elapsed)
+	}
+	if m.turnTokens > 0 {
+		working += " · ↓" + shortTokens(m.turnTokens)
+	}
+	if n := len(m.pendingInterject); n > 0 {
+		var queued string
+		if n == 1 {
+			queued = " · ✎ feedback queued"
+		} else {
+			queued = fmt.Sprintf(" · ✎ %d queued", n)
+		}
+		if styled {
+			working += dim(queued)
+		} else {
+			working += queued
+		}
+	}
+	return working
+}
+
 func (m chatTUI) View() tea.View {
 	boxW := m.width
 	if boxW < 10 {
@@ -2165,6 +2300,7 @@ func (m chatTUI) View() tea.View {
 	}
 	hideComposer := m.hideComposer()
 	shellMode := strings.HasPrefix(strings.TrimSpace(m.input.Value()), "!")
+	cancelRequested := m.cancelRequested()
 	var box string
 	if !hideComposer {
 		style := inputBoxStyle.Width(boxW)
@@ -2220,6 +2356,8 @@ func (m chatTUI) View() tea.View {
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusPlanApproval
 	case m.pendingApproval != nil:
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusToolApproval
+	case cancelRequested:
+		status = "  " + modeTag + " · " + i18n.M.CtrlCQuitHint
 	case shellMode:
 		status = "  " + modeTag + " · " + i18n.M.ShellModeHint
 	case m.ctrl.AutoApproveTools():
@@ -2236,24 +2374,7 @@ func (m chatTUI) View() tea.View {
 	// The spinning "thinking…" indicator is its own line ABOVE the input box (shown
 	// only while a turn runs); the status/data rows stay below. This mirrors Claude
 	// Code: live progress over the composer, shortcuts + stats under it.
-	var working string
-	if m.state == tuiRunning {
-		if m.retryAttempt > 0 {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusRetryingFmt, m.spinner.View(), m.retryAttempt, m.retryMax)
-		} else {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusThinkingFmt, m.spinner.View(), m.elapsed)
-			if m.turnTokens > 0 {
-				working += " · ↓" + shortTokens(m.turnTokens)
-			}
-			if n := len(m.pendingInterject); n > 0 {
-				if n == 1 {
-					working += dim(" · ✎ feedback queued")
-				} else {
-					working += dim(fmt.Sprintf(" · ✎ %d queued", n))
-				}
-			}
-		}
-	}
+	working := m.runningWorkingLine(cancelRequested, true)
 	// Second status row: the live data (model, git, effort, context gauge, cache
 	// rates, jobs, balance). It lives on its own row so it's always visible; if it
 	// exceeds the terminal width it wraps to additional rows instead of being
@@ -2310,6 +2431,10 @@ func (m chatTUI) View() tea.View {
 		parts = append(parts, card)
 		rowsAboveBox += strings.Count(card, "\n") + 1
 	}
+	if card := m.renderCopyPicker(); card != "" {
+		parts = append(parts, card)
+		rowsAboveBox += strings.Count(card, "\n") + 1
+	}
 	if menu := m.renderCompletion(); menu != "" {
 		parts = append(parts, menu)
 		rowsAboveBox += strings.Count(menu, "\n") + 1
@@ -2363,7 +2488,7 @@ func (m chatTUI) View() tea.View {
 	}
 	v := tea.NewView(mainArea + "\n" + strings.Join(parts, "\n"))
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
+	v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript; text selection is handled in-app
 	// Anchor the real terminal cursor at the textarea's insertion point only when
 	// the composer is visible. input.Cursor() is relative to the textarea; offset
 	// by the viewport height + rows above + the box's top border row (+1 column
@@ -2546,6 +2671,9 @@ func (m chatTUI) renderApprovalBanner() string {
 		choices = fmt.Sprintf(i18n.M.BashPrefixChoices, prefixRule, prefixRule)
 	}
 	text := fmt.Sprintf(i18n.M.ToolApprovalPromptFmt, name, subj, detail, choices)
+	if reason := strings.TrimSpace(m.pendingApproval.Reason); reason != "" {
+		text += " · " + truncateSubject(reason, w)
+	}
 	return approvalBannerStyle.Width(w).Render("⏸ " + text)
 }
 
@@ -2682,6 +2810,7 @@ func (m chatTUI) computeStatusLineCount(width int) int {
 		return 2 // safe default for tests without a real controller
 	}
 	shellMode := strings.HasPrefix(strings.TrimSpace(m.input.Value()), "!")
+	cancelRequested := m.cancelRequested()
 
 	// Replicate the first status line (mode tag + state) from View().
 	// ModeTag is rendered with Padding(0,1) in View() — add the same padding
@@ -2708,6 +2837,8 @@ func (m chatTUI) computeStatusLineCount(width int) int {
 		status += " · " + i18n.M.ChatStatusPlanApproval
 	case m.pendingApproval != nil:
 		status += " · " + i18n.M.ChatStatusToolApproval
+	case cancelRequested:
+		status += " · " + i18n.M.CtrlCQuitHint
 	case shellMode:
 		status += " · " + i18n.M.ShellModeHint
 	case m.ctrl.AutoApproveTools():
@@ -2745,24 +2876,7 @@ func (m chatTUI) computeStatusLineCount(width int) int {
 	}
 
 	// Replicate the working (spinner) line from View(), shown only while a turn runs.
-	var working string
-	if m.state == tuiRunning {
-		if m.retryAttempt > 0 {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusRetryingFmt, m.spinner.View(), m.retryAttempt, m.retryMax)
-		} else {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusThinkingFmt, m.spinner.View(), m.elapsed)
-			if m.turnTokens > 0 {
-				working += " · ↓" + shortTokens(m.turnTokens)
-			}
-			if n := len(m.pendingInterject); n > 0 {
-				if n == 1 {
-					working += " · ✎ feedback queued"
-				} else {
-					working += fmt.Sprintf(" · ✎ %d queued", n)
-				}
-			}
-		}
-	}
+	working := m.runningWorkingLine(cancelRequested, false)
 
 	// Count wrapped rows for every piece that View() renders as wrapped.
 	var lines int
@@ -2787,93 +2901,8 @@ type pastedBlock struct {
 	image bool // an image attachment: expands to its bare @ref, not a wrapped block
 }
 
-func pastedLineCount(s string) int {
-	if s == "" {
-		return 0
-	}
-	return strings.Count(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"), "\n") + 1
-}
-
-func foldedPasteLabel(id, lines int) string {
-	return fmt.Sprintf("[Pasted text #%d · %d lines]", id, lines)
-}
-
-func renderFoldedPasteBlock(block pastedBlock) string {
-	return fmt.Sprintf("%s\n\n--- Begin %s ---\n%s\n--- End %s ---", block.label, block.label, block.text, block.label)
-}
-
-func shouldFoldPastedText(s string) bool {
-	return len([]rune(s)) >= foldedPasteMinChars || pastedLineCount(s) >= foldedPasteMinLines
-}
-
 func (m *chatTUI) chooserTyping() bool {
 	return m.chooser != nil && m.chooser.typing
-}
-
-func (m *chatTUI) shouldFoldPaste(s string) bool {
-	return shouldFoldPastedText(s)
-}
-
-func (m *chatTUI) insertFoldedPaste(s string) {
-	label := foldedPasteLabel(m.nextPasteID, pastedLineCount(s))
-	m.nextPasteID++
-	m.pastedBlocks = append(m.pastedBlocks, pastedBlock{label: label, text: s})
-	m.input.InsertString(label + " ")
-}
-
-// insertImageRef puts a deletable [image #N] token in the input box (mapped to
-// the saved attachment's @ref, expanded on submit) so a dragged/pasted image is
-// edited and removed like any other text, not stranded in a separate tray.
-func (m *chatTUI) insertImageRef(path string) {
-	label := fmt.Sprintf("[image #%d]", m.nextPasteID)
-	m.nextPasteID++
-	m.pastedBlocks = append(m.pastedBlocks, pastedBlock{label: label, text: "@" + path, image: true})
-	m.input.InsertString(label + " ")
-	m.growInputToFit()
-	m.updateCompletion()
-}
-
-func (m *chatTUI) expandPastedBlocks(displayed string) string {
-	sent := displayed
-	for _, block := range m.pastedBlocks {
-		if !strings.Contains(sent, block.label) {
-			continue
-		}
-		repl := renderFoldedPasteBlock(block)
-		if block.image {
-			repl = block.text
-		}
-		sent = strings.ReplaceAll(sent, block.label, repl)
-	}
-	return sent
-}
-
-func (m *chatTUI) pasteLabelsIn(s string) []string {
-	var labels []string
-	for _, block := range m.pastedBlocks {
-		if strings.Contains(s, block.label) {
-			labels = append(labels, block.label)
-		}
-	}
-	return labels
-}
-
-func (m *chatTUI) clearSubmittedPastes() {
-	if len(m.pendingPastes) == 0 {
-		return
-	}
-	submitted := make(map[string]bool, len(m.pendingPastes))
-	for _, label := range m.pendingPastes {
-		submitted[label] = true
-	}
-	kept := m.pastedBlocks[:0]
-	for _, block := range m.pastedBlocks {
-		if !submitted[block.label] {
-			kept = append(kept, block)
-		}
-	}
-	m.pastedBlocks = kept
-	m.pendingPastes = nil
 }
 
 func (m *chatTUI) growInputToFit() {
@@ -2890,179 +2919,6 @@ func (m *chatTUI) growInputToFit() {
 	if lines != m.input.Height() {
 		m.input.SetHeight(lines)
 	}
-}
-
-func pasteClipboardImage() tea.Cmd {
-	return func() tea.Msg {
-		path, err := control.SaveClipboardImage()
-		return clipboardImageMsg{path: path, err: err}
-	}
-}
-
-func pasteClipboard() tea.Cmd {
-	return func() tea.Msg {
-		path, imageErr := control.SaveClipboardImage()
-		if imageErr == nil {
-			return clipboardPasteMsg{path: path}
-		}
-		text, textErr := clipboard.ReadAll()
-		if textErr == nil && text != "" {
-			return clipboardPasteMsg{text: text}
-		}
-		if textErr != nil {
-			return clipboardPasteMsg{err: fmt.Errorf("%v; text paste failed: %w", imageErr, textErr)}
-		}
-		return clipboardPasteMsg{err: imageErr}
-	}
-}
-
-func (m *chatTUI) attachPastedImages(text string) bool {
-	sources, ok := pastedImageSources(text)
-	if !ok {
-		return false
-	}
-	for _, src := range sources {
-		path, err := savePastedImageSource(src)
-		if err != nil {
-			m.notice("paste image: " + err.Error())
-			continue
-		}
-		m.insertImageRef(path)
-	}
-	return true
-}
-
-var markdownImageSourceRe = regexp.MustCompile(`!\[[^\]]*\]\(([^)]+)\)`)
-
-func pastedImageSources(text string) ([]string, bool) {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return nil, false
-	}
-	if isDataImage(trimmed) {
-		return []string{trimmed}, true
-	}
-	if matches := markdownImageSourceRe.FindAllStringSubmatch(trimmed, -1); len(matches) > 0 {
-		rest := strings.TrimSpace(markdownImageSourceRe.ReplaceAllString(trimmed, ""))
-		if rest == "" {
-			sources := make([]string, 0, len(matches))
-			for _, m := range matches {
-				sources = append(sources, m[1])
-			}
-			return sources, true
-		}
-	}
-
-	lines := nonEmptyPasteLines(trimmed)
-	if len(lines) > 0 && allImageSources(lines) {
-		return lines, true
-	}
-	fields := strings.Fields(trimmed)
-	if len(fields) > 1 && allImageSources(fields) {
-		return fields, true
-	}
-	return nil, false
-}
-
-func nonEmptyPasteLines(text string) []string {
-	var out []string
-	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
-func allImageSources(sources []string) bool {
-	if len(sources) == 0 {
-		return false
-	}
-	for _, src := range sources {
-		if !looksLikeImageSource(src) {
-			return false
-		}
-	}
-	return true
-}
-
-func looksLikeImageSource(src string) bool {
-	if isDataImage(strings.TrimSpace(src)) {
-		return true
-	}
-	path, ok := pastedImagePath(src)
-	if !ok {
-		return false
-	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
-		return true
-	}
-	return false
-}
-
-func savePastedImageSource(src string) (string, error) {
-	src = strings.TrimSpace(src)
-	if isDataImage(src) {
-		return control.SaveImageDataURL(src)
-	}
-	path, ok := pastedImagePath(src)
-	if !ok {
-		return "", fmt.Errorf("unsupported pasted image source")
-	}
-	return control.SaveImageFile(path)
-}
-
-func isDataImage(src string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(src)), "data:image/")
-}
-
-func pastedImagePath(src string) (string, bool) {
-	src = strings.TrimSpace(src)
-	src = strings.TrimPrefix(src, "@")
-	quoted := (strings.HasPrefix(src, `"`) && strings.HasSuffix(src, `"`)) || (strings.HasPrefix(src, `'`) && strings.HasSuffix(src, `'`))
-	src = strings.Trim(src, "\"'")
-	if src == "" {
-		return "", false
-	}
-	if !quoted && strings.ContainsAny(src, " \t\r\n") {
-		return "", false
-	}
-	lower := strings.ToLower(src)
-	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
-		return "", false
-	}
-	if strings.HasPrefix(lower, "file://") {
-		u, err := url.Parse(src)
-		if err != nil || u.Path == "" {
-			return "", false
-		}
-		src = u.Path
-	}
-	if strings.HasPrefix(src, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil && home != "" {
-			src = filepath.Join(home, strings.TrimPrefix(src, "~/"))
-		}
-	}
-	return filepath.Clean(src), true
-}
-
-// pastedFileRef turns a dragged/pasted non-image file path into an @reference so
-// it attaches instead of landing as literal text (and, for a POSIX path, being
-// misread as a slash command). Images are handled earlier; only path-shaped
-// content (a separator) that points at a real file qualifies, so an ordinary
-// pasted word is left alone.
-func pastedFileRef(content string) (string, bool) {
-	path, ok := pastedImagePath(content)
-	if !ok || !strings.ContainsAny(path, `/\`) {
-		return "", false
-	}
-	if info, err := os.Stat(path); err != nil || info.IsDir() {
-		return "", false
-	}
-	return "@" + path, true
 }
 
 // cycleMode handles the Shift+Tab mode gesture. It toggles Plan only; tool
@@ -3355,6 +3211,28 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 		m.finalizeStreamed()
 		m.commitLine(fmt.Sprintf("  %s %s", glyph, e.Text))
 
+	case event.GuardianAssessment:
+		m.finalizeStreamed()
+		g := e.Guardian
+		line := fmt.Sprintf("Guardian %s · %s", g.Outcome, g.Tool)
+		if g.Subject != "" {
+			line += " · " + truncateSubject(g.Subject, m.width)
+		}
+		if g.RiskLevel != "" {
+			line += " · risk=" + g.RiskLevel
+		}
+		if g.UserAuthorization != "" {
+			line += " · authorization=" + g.UserAuthorization
+		}
+		if g.Rationale != "" {
+			line += " · " + g.Rationale
+		}
+		if g.Outcome == "deny" {
+			m.commitLine("  ! " + line)
+		} else {
+			m.commitLine("  · " + line)
+		}
+
 	case event.CompactionStarted:
 		m.finalizeStreamed()
 		m.commitLine(dim("  ⋯ " + i18n.M.CompactionWorking))
@@ -3465,6 +3343,15 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/clear":
 		m.echoLocalCommand(input)
 		m.clearConfirm = &clearConfirm{confirm: 1}
+	case "/cls":
+		m.echoLocalCommand(input)
+		m.finalizeStreamed()
+		m.clearTranscriptDisplay()
+		m.commitLine(strings.TrimRight(
+			renderTUIBanner(m.label, "", transcriptContentWidth(m.width, m.nativeScrollback)), "\n"))
+		m.transcriptDirty = true
+		m.forceGotoBottom = true
+		m.notice(i18n.M.SlashClsDone)
 	case "/resume":
 		m.runResumeCommand(input)
 	case "/rename":
@@ -3487,6 +3374,9 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/reasoning-language":
 		m.echoLocalCommand(input)
 		m.runReasoningLanguageCommand(input)
+	case "/memory-v5":
+		m.echoLocalCommand(input)
+		m.runMemoryV5Command(input)
 	case "/rewind":
 		m.echoLocalCommand(input)
 		m.openRewind()
@@ -3523,6 +3413,26 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/hooks":
 		m.echoLocalCommand(input)
 		m.runHooksSubcommand(input)
+	case "/reload-cmd":
+		m.echoLocalCommand(input)
+		if m.ctrl == nil {
+			m.notice("controller not ready")
+			return nil
+		}
+		if m.ctrl.Running() {
+			m.notice("wait for the current turn to finish, then retry /reload-cmd")
+			return nil
+		}
+		prev := len(m.commands)
+		err := m.ctrl.ReloadCommands(context.Background())
+		m.commands = m.ctrl.Commands()
+		m.updateCompletion()
+		if err != nil {
+			m.notice("reload-cmd: " + err.Error())
+			return nil
+		}
+		m.notice(fmt.Sprintf("commands reloaded: %d → %d commands", prev, len(m.commands)))
+
 	case "/paste-image":
 		return pasteClipboardImage()
 	case "/output-style", "/output-styles":
@@ -3556,7 +3466,7 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		m.showMemory()
 	case "/migrate", "/migration":
 		m.echoLocalCommand(input)
-		migration.RunLegacyRescue(event.FuncSink(func(e event.Event) {
+		migration.RunLegacyRescueCommand(strings.TrimSpace(strings.TrimPrefix(input, cmd)), event.FuncSink(func(e event.Event) {
 			if e.Kind == event.Notice {
 				m.notice(e.Text)
 			}
@@ -3574,6 +3484,10 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		}
 	case "/quit", "/exit":
 		return tea.Quit
+	case "/copy":
+		return m.runCopyCommand(input)
+	case "/export":
+		m.runExportCommand(input)
 	case "/forget":
 		m.forgetMemory(strings.TrimSpace(strings.TrimPrefix(input, cmd)))
 	default:
@@ -3600,7 +3514,8 @@ func (m *chatTUI) runGoalSubcommand(input string) tea.Cmd {
 	case control.GoalCommandSet:
 		m.planMode = false
 		m.ctrl.SetPlanMode(false)
-		m.ctrl.SetGoal(cmd.Text)
+		m.ctrl.SetGoalWithResearchMode(cmd.Text, cmd.ResearchMode)
+		m.ctrl.GoalStrict(cmd.Strict)
 		m.notice(fmt.Sprintf(i18n.M.GoalSetFmt, control.ShortGoalForNotice(cmd.Text)))
 		return m.startTurn("Start pursuing the active goal now.", input, input)
 	case control.GoalCommandClear:
@@ -3617,6 +3532,158 @@ func (m *chatTUI) runGoalSubcommand(input string) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// runCopyCommand copies the Nth-latest assistant message from the current turn
+// (after the last user message) to the clipboard.
+//
+//   - "/copy"   — shows a numbered list of assistant messages to choose from.
+//   - "/copy N" — copies the Nth message directly (1 = most recent).
+//
+// Counting does not cross user message boundaries.
+func (m *chatTUI) runCopyCommand(input string) tea.Cmd {
+	m.echoLocalCommand(input)
+	// "/copy N" copies the Nth-newest assistant message directly (1 = most
+	// recent), matching the picker's newest-first ordering. A bare "/copy"
+	// (or a non-numeric argument) opens the interactive picker instead.
+	arg := strings.TrimSpace(strings.TrimPrefix(input, "/copy"))
+	if n, err := strconv.Atoi(arg); err == nil && n > 0 {
+		msgs := m.ctrl.History()
+		parts := copyAssistantParts(msgs)
+		if len(parts) == 0 {
+			m.notice(i18n.M.SlashCopyEmpty)
+			return nil
+		}
+		// copyAssistantParts is oldest-first; index 0 of the reversed slice
+		// is the most recent, so "/copy 1" = parts[len-1].
+		idx := len(parts) - n
+		if idx < 0 || idx >= len(parts) {
+			m.notice(i18n.M.SlashCopyEmpty)
+			return nil
+		}
+		m.notice(i18n.M.SlashCopyDone)
+		return copyToClipboard(parts[idx])
+	}
+	m.openCopyPicker()
+	return nil
+}
+
+// firstLine returns the first non-empty line of s, truncated to 80 runes.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			runes := []rune(t)
+			if len(runes) > 80 {
+				return string(runes[:77]) + "..."
+			}
+			return t
+		}
+	}
+	return "..."
+}
+
+// copyAssistantParts returns the Content of assistant messages after the last
+// user message in msgs, skipping empty strings and model placeholders ("…", "...").
+// The result is chronological (oldest first).
+func copyAssistantParts(msgs []provider.Message) []string {
+	lastUserIdx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == provider.RoleUser {
+			lastUserIdx = i
+			break
+		}
+	}
+	start := lastUserIdx + 1
+	if lastUserIdx < 0 {
+		start = 0
+	}
+	var parts []string
+	for i := start; i < len(msgs); i++ {
+		if msgs[i].Role != provider.RoleAssistant {
+			continue
+		}
+		c := strings.TrimSpace(msgs[i].Content)
+		if c == "" || c == "..." || c == "…" {
+			continue
+		}
+		parts = append(parts, c)
+	}
+	return parts
+}
+
+// runExportCommand exports the entire session as a markdown file, excluding
+// system messages, reasoning/thinking content, and tool calls/results.
+func (m *chatTUI) runExportCommand(input string) {
+	m.echoLocalCommand(input)
+	msgs := m.ctrl.History()
+	if len(msgs) == 0 {
+		m.notice(i18n.M.SlashExportEmpty)
+		return
+	}
+
+	var b strings.Builder
+	b.WriteString("# reasonix session\n\n")
+	lastRole := provider.Role("")
+	exportedMessages := 0
+	for _, msg := range msgs {
+		switch msg.Role {
+		case provider.RoleUser:
+			// Skip internal steer messages.
+			if _, isSteer := agent.SteerText(msg.Content); isSteer {
+				continue
+			}
+			content := exportUserContent(msg.Content)
+			if content == "" {
+				continue
+			}
+			if lastRole != provider.RoleUser {
+				b.WriteString("## User\n\n")
+			}
+			b.WriteString(content)
+			b.WriteString("\n\n")
+			exportedMessages++
+			lastRole = provider.RoleUser
+		case provider.RoleAssistant:
+			content := strings.TrimSpace(msg.Content)
+			if content == "" {
+				continue
+			}
+			if lastRole != provider.RoleAssistant {
+				b.WriteString("## Assistant\n\n")
+			}
+			b.WriteString(content)
+			b.WriteString("\n\n")
+			exportedMessages++
+			lastRole = provider.RoleAssistant
+		}
+	}
+	if exportedMessages == 0 {
+		m.notice(i18n.M.SlashExportEmpty)
+		return
+	}
+
+	// Choose a filename. If the workspace has a root, save there; otherwise
+	// the current directory. Use a timestamp-based name.
+	dir := "."
+	if m.ctrl != nil {
+		if wr := m.ctrl.WorkspaceRoot(); wr != "" {
+			dir = wr
+		}
+	}
+	ts := time.Now().Format("20060102-150405")
+	filename := fmt.Sprintf("session-%s.md", ts)
+	path := filepath.Join(dir, filename)
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		m.notice(fmt.Sprintf("%s: %v", i18n.M.SlashUnknown, err))
+		return
+	}
+	m.notice(fmt.Sprintf(i18n.M.SlashExportDoneFmt, path))
+}
+
+func exportUserContent(content string) string {
+	content = control.StripComposePrefixes(content)
+	content = control.StripReferencedContextPrefix(content)
+	return strings.TrimSpace(content)
 }
 
 func (m *chatTUI) echoLocalCommand(input string) {

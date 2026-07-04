@@ -116,6 +116,111 @@ func writeLegacyEventSession(t *testing.T, dir, name, prompt, reply string, modT
 	return path
 }
 
+func TestSessionListCacheRefillsAfterInvalidate(t *testing.T) {
+	cache := &sessionListCache{byDir: map[string]sessionListCacheEntry{}}
+	dir := t.TempDir()
+	first := []agent.SessionInfo{{Path: filepath.Join(dir, "first.jsonl")}}
+	second := []agent.SessionInfo{{Path: filepath.Join(dir, "second.jsonl")}}
+
+	token := cache.versionToken()
+	cache.put(dir, first, map[string]string{"first.jsonl": "First"}, token)
+	if infos, titles, ok := cache.get(dir); !ok || len(infos) != 1 || filepath.Base(infos[0].Path) != "first.jsonl" || titles["first.jsonl"] != "First" {
+		t.Fatalf("initial cache entry = %+v, %+v, %v", infos, titles, ok)
+	}
+
+	cache.invalidate()
+	if _, _, ok := cache.get(dir); ok {
+		t.Fatalf("cache entry survived invalidate")
+	}
+	cache.put(dir, first, map[string]string{"first.jsonl": "stale"}, token)
+	if _, _, ok := cache.get(dir); ok {
+		t.Fatalf("stale token repopulated cache after invalidate")
+	}
+
+	token = cache.versionToken()
+	cache.put(dir, second, map[string]string{"second.jsonl": "Second"}, token)
+	if infos, titles, ok := cache.get(dir); !ok || len(infos) != 1 || filepath.Base(infos[0].Path) != "second.jsonl" || titles["second.jsonl"] != "Second" {
+		t.Fatalf("refilled cache entry = %+v, %+v, %v", infos, titles, ok)
+	}
+}
+
+func TestRenameSessionInvalidatesProjectTreeCache(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	oldProjectCache := projectSessionCache
+	projectSessionCache = &sessionListCache{byDir: map[string]sessionListCacheEntry{}}
+	t.Cleanup(func() {
+		projectSessionCache = oldProjectCache
+	})
+
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "rename-me.jsonl")
+	if err := os.WriteFile(sessionPath, []byte(`{"role":"user","content":"hello"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	ctrl := control.New(control.Options{SessionDir: dir, SessionPath: sessionPath, Label: "test"})
+	defer ctrl.Close()
+	app := NewApp()
+	app.setTestCtrl(ctrl, "")
+
+	token := projectSessionCache.versionToken()
+	projectSessionCache.put(dir, []agent.SessionInfo{{Path: sessionPath}}, map[string]string{"rename-me.jsonl": "old"}, token)
+	if _, _, ok := projectSessionCache.get(dir); !ok {
+		t.Fatalf("expected primed project tree cache")
+	}
+	if err := app.RenameSession(sessionPath, "new title"); err != nil {
+		t.Fatalf("RenameSession: %v", err)
+	}
+	if _, _, ok := projectSessionCache.get(dir); ok {
+		t.Fatalf("RenameSession should invalidate project tree cache")
+	}
+}
+
+func TestTopicMetadataUpdatesPreserveExistingEntriesWhenTimedReadSlotsFull(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	if err := saveTopicTitles(projectRoot, map[string]string{"old": "Old"}); err != nil {
+		t.Fatalf("save old title: %v", err)
+	}
+	if err := saveTopicTitleSources(projectRoot, map[string]string{"old": topicTitleSourceManual}); err != nil {
+		t.Fatalf("save old source: %v", err)
+	}
+	if err := saveTopicCreatedAts(projectRoot, map[string]int64{"old": 100}); err != nil {
+		t.Fatalf("save old created-at: %v", err)
+	}
+
+	release := occupyReadFileWithTimeoutSlots(t)
+	if err := setTopicTitleWithSource(projectRoot, "new", "New", topicTitleSourceAuto); err != nil {
+		t.Fatalf("setTopicTitleWithSource: %v", err)
+	}
+	if err := setTopicCreatedAt(projectRoot, "new", 200); err != nil {
+		t.Fatalf("setTopicCreatedAt: %v", err)
+	}
+	release()
+
+	titles := loadTopicTitles(projectRoot)
+	if got := titles["old"]; got != "Old" {
+		t.Fatalf("old title = %q, want Old (all titles: %v)", got, titles)
+	}
+	if got := titles["new"]; got != "New" {
+		t.Fatalf("new title = %q, want New (all titles: %v)", got, titles)
+	}
+	sources := loadTopicTitleSources(projectRoot)
+	if got := sources["old"]; got != topicTitleSourceManual {
+		t.Fatalf("old source = %q, want %q (all sources: %v)", got, topicTitleSourceManual, sources)
+	}
+	if got := sources["new"]; got != topicTitleSourceAuto {
+		t.Fatalf("new source = %q, want %q (all sources: %v)", got, topicTitleSourceAuto, sources)
+	}
+	created := loadTopicCreatedAts(projectRoot)
+	if got := created["old"]; got != 100 {
+		t.Fatalf("old created-at = %d, want 100 (all created: %v)", got, created)
+	}
+	if got := created["new"]; got != 200 {
+		t.Fatalf("new created-at = %d, want 200 (all created: %v)", got, created)
+	}
+}
+
 func TestDeleteTopicKeepsSessionHistory(t *testing.T) {
 	isolateDesktopUserDirs(t)
 
@@ -357,6 +462,54 @@ func TestLegacySessionsMigrateIntoGlobalTopics(t *testing.T) {
 	}
 }
 
+func TestTopicMigrationMarkerRescansWhenSessionFileChanges(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	writeLegacySession(t, dir, "first.jsonl", "first legacy prompt", time.Now().Add(-time.Hour))
+
+	// First render migrates the legacy session and, with nothing deferred, stamps
+	// the one-shot marker so later renders can skip the scan.
+	NewApp().ListProjectTree()
+	if _, err := os.Stat(filepath.Join(dir, topicMigrationMarker)); err != nil {
+		t.Fatalf("expected migration marker after a complete pass: %v", err)
+	}
+
+	// A CLI-created session added after the marker invalidates the lightweight
+	// gate and gets a fresh migration pass.
+	time.Sleep(10 * time.Millisecond)
+	second := writeLegacySession(t, dir, "second.jsonl", "second legacy prompt", time.Now())
+	NewApp().ListProjectTree()
+	meta, ok, err := agent.LoadBranchMeta(second)
+	if err != nil {
+		t.Fatalf("load second meta: %v", err)
+	}
+	if !ok || strings.TrimSpace(meta.TopicID) != legacySessionTopicID(second) {
+		t.Fatalf("new session after marker should be migrated, got ok=%v meta=%+v", ok, meta)
+	}
+}
+
+func TestTopicMigrationDefersEmptyLegacySession(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	// An empty legacy session (no user turns) is not migratable yet but could gain
+	// content later, so the pass must NOT mark the dir done — otherwise the gate
+	// would hide it forever.
+	if err := os.WriteFile(filepath.Join(dir, "empty.jsonl"), nil, 0o644); err != nil {
+		t.Fatalf("write empty session: %v", err)
+	}
+
+	NewApp().ListProjectTree()
+	if _, err := os.Stat(filepath.Join(dir, topicMigrationMarker)); err == nil {
+		t.Fatal("an empty legacy session must defer marking, but the dir was marked done")
+	}
+}
+
 func TestV05LegacyEventSessionsImportIntoGlobalTopic(t *testing.T) {
 	home := isolateDesktopUserDirs(t)
 
@@ -512,6 +665,103 @@ func TestBuildTabControllerRestoresPinnedSessionBeforeTopicFallback(t *testing.T
 	}
 }
 
+func TestBuildTabControllerUsesPinnedSessionMetaWorkspace(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectA := t.TempDir()
+	projectB := t.TempDir()
+	if err := addProject(projectA, "Project A"); err != nil {
+		t.Fatalf("add project A: %v", err)
+	}
+	if err := addProject(projectB, "Project B"); err != nil {
+		t.Fatalf("add project B: %v", err)
+	}
+
+	topicID := "topic_restore_workspace"
+	topicTitle := "Restore workspace"
+	sessionDirA := desktopSessionDir(projectA)
+	if err := os.MkdirAll(sessionDirA, 0o755); err != nil {
+		t.Fatalf("mkdir project A sessions: %v", err)
+	}
+	pinned := writeTopicSessionWithPrompt(t, sessionDirA, "project-a.jsonl", topicID, topicTitle, projectA, "project A prompt", time.Now())
+
+	app := NewApp()
+	tab := app.createTabEntryWithID("project", projectB, topicID, "tab_stale_workspace")
+	tab.TopicTitle = topicTitle
+	tab.SessionPath = pinned
+	tab.sink = &tabEventSink{tabID: tab.ID, app: app}
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+
+	app.buildTabController(tab)
+	if tab.Ctrl == nil {
+		t.Fatalf("tab controller was not built: %s", tab.StartupErr)
+	}
+	defer tab.Ctrl.Close()
+
+	if got := filepath.Clean(tab.Ctrl.SessionPath()); got != filepath.Clean(pinned) {
+		t.Fatalf("restored session path = %q, want pinned %q", got, pinned)
+	}
+	if got := normalizeProjectRoot(tab.WorkspaceRoot); got != normalizeProjectRoot(projectA) {
+		t.Fatalf("tab workspace root = %q, want project A %q", got, normalizeProjectRoot(projectA))
+	}
+	history := tab.Ctrl.History()
+	if len(history) == 0 || history[0].Content != "project A prompt" {
+		t.Fatalf("restored history = %+v, want project A prompt", history)
+	}
+}
+
+func TestPersistTabSessionPathUsesSessionDirOwnerBeforeSavingMeta(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectA := t.TempDir()
+	projectB := t.TempDir()
+	if err := addProject(projectA, "Project A"); err != nil {
+		t.Fatalf("add project A: %v", err)
+	}
+	if err := addProject(projectB, "Project B"); err != nil {
+		t.Fatalf("add project B: %v", err)
+	}
+
+	topicID := "topic_owner_before_meta"
+	topicTitle := "Owner before meta"
+	sessionDirA := desktopSessionDir(projectA)
+	if err := os.MkdirAll(sessionDirA, 0o755); err != nil {
+		t.Fatalf("mkdir project A sessions: %v", err)
+	}
+	sessionPath := writeTopicSessionWithPrompt(t, sessionDirA, "project-a.jsonl", topicID, topicTitle, projectA, "project A prompt", time.Now())
+	meta, ok, err := agent.LoadBranchMeta(sessionPath)
+	if err != nil || !ok {
+		t.Fatalf("load branch meta: ok=%v err=%v", ok, err)
+	}
+	meta.WorkspaceRoot = projectB
+	if err := agent.SaveBranchMetaPreserveUpdated(sessionPath, meta); err != nil {
+		t.Fatalf("pollute branch meta: %v", err)
+	}
+
+	app := NewApp()
+	tab := app.createTabEntryWithID("project", projectB, topicID, "tab_stale_workspace")
+	tab.TopicTitle = topicTitle
+	tab.SessionPath = sessionPath
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+
+	app.persistTabSessionPath(tab, sessionPath)
+
+	if got := normalizeProjectRoot(tab.WorkspaceRoot); got != normalizeProjectRoot(projectA) {
+		t.Fatalf("tab workspace root = %q, want project A %q", got, normalizeProjectRoot(projectA))
+	}
+	gotMeta, ok, err := agent.LoadBranchMeta(sessionPath)
+	if err != nil || !ok {
+		t.Fatalf("reload branch meta: ok=%v err=%v", ok, err)
+	}
+	if gotMeta.Scope != "project" || normalizeProjectRoot(gotMeta.WorkspaceRoot) != normalizeProjectRoot(projectA) {
+		t.Fatalf("saved branch meta scope/root = %q/%q, want project/%q", gotMeta.Scope, gotMeta.WorkspaceRoot, normalizeProjectRoot(projectA))
+	}
+}
+
 func TestBuildTabControllerIgnoresStaleSessionModelWhenTabModelResolves(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	t.Setenv("REASONIX_TEST_KEY", "sk-test")
@@ -587,6 +837,72 @@ func TestLoadPinnedTabSessionFallsBackToMigratedBasename(t *testing.T) {
 	}
 	if filepath.Clean(pinnedPath) != filepath.Clean(path) {
 		t.Fatalf("pinned path = %q, want %q", pinnedPath, path)
+	}
+}
+
+func TestPinnedTabSessionPathRejectsExistingAbsolutePathOutsideDir(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	pathA := writeLegacySession(t, dirA, "same-name.jsonl", "project A", time.Now())
+	_ = writeLegacySession(t, dirB, filepath.Base(pathA), "project B", time.Now())
+
+	if got, ok := pinnedTabSessionPath(dirB, pathA); ok {
+		t.Fatalf("pinnedTabSessionPath mapped existing absolute path outside dir to %q", got)
+	}
+}
+
+func TestLoadPinnedTabSessionSkipsCleanupPending(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	path := writeLegacySession(t, dir, "pending-pinned.jsonl", "pending pinned", time.Now())
+	if err := agent.MarkCleanupPending(path, "delete"); err != nil {
+		t.Fatal(err)
+	}
+
+	if loaded, pinnedPath, ok := loadPinnedTabSession(dir, path); ok || loaded != nil || pinnedPath != "" {
+		t.Fatalf("loadPinnedTabSession cleanup-pending = loaded:%v path:%q ok:%v, want skipped", loaded, pinnedPath, ok)
+	}
+}
+
+func TestBuildTabControllerSkipsCleanupPendingPinnedSession(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	pending := writeLegacySession(t, dir, "pending-startup.jsonl", "pending startup", time.Now())
+	if err := agent.MarkCleanupPending(pending, "delete"); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	tab := app.createTabEntryWithID("global", globalTabWorkspaceRoot(), "", "tab_pending")
+	tab.SessionPath = pending
+	tab.sink = &tabEventSink{tabID: tab.ID, app: app}
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+
+	app.buildTabController(tab)
+	if tab.Ctrl == nil {
+		t.Fatalf("tab controller was not built: %s", tab.StartupErr)
+	}
+	defer tab.Ctrl.Close()
+
+	if got := filepath.Clean(tab.Ctrl.SessionPath()); got == filepath.Clean(pending) {
+		t.Fatalf("startup bound cleanup-pending pinned session path %q", got)
+	}
+	for _, msg := range tab.Ctrl.History() {
+		if msg.Content == "pending startup" {
+			t.Fatalf("startup loaded cleanup-pending history: %+v", tab.Ctrl.History())
+		}
 	}
 }
 
@@ -1069,6 +1385,120 @@ func TestRenameTopicRecreatesDeletedProjectTitleIndexFromSessionMeta(t *testing.
 	}
 }
 
+func TestOpenProjectTabRecoversMissingTopicTitleFromSessionMeta(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := robustTempDir(t)
+	app := NewApp()
+	topic, err := app.CreateTopic("project", projectRoot, "旧标题")
+	if err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	dir := desktopSessionDir(projectRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	sessionPath := writeTopicSessionWithPrompt(t, dir, "stored-meta.jsonl", topic.ID, "用户保存标题", projectRoot, "first prompt should not win", time.Now())
+	if err := os.Remove(topicTitlesPath(projectRoot)); err != nil {
+		t.Fatalf("remove topic titles: %v", err)
+	}
+	if got := loadTopicTitleSource(projectRoot, topic.ID); got != topicTitleSourceManual {
+		t.Fatalf("precondition title source = %q, want manual", got)
+	}
+
+	meta, err := app.OpenProjectTab(projectRoot, topic.ID)
+	if err != nil {
+		t.Fatalf("open project tab: %v", err)
+	}
+	tab := waitForTabReady(t, app, meta.ID)
+	if got := filepath.Clean(tab.Ctrl.SessionPath()); got != filepath.Clean(sessionPath) {
+		t.Fatalf("opened session path = %q, want %q", got, sessionPath)
+	}
+	if got := meta.TopicTitle; got != "用户保存标题" {
+		t.Fatalf("opened topic title = %q, want 用户保存标题", got)
+	}
+	if got := loadTopicTitle(projectRoot, topic.ID); got != "用户保存标题" {
+		t.Fatalf("stored topic title = %q, want 用户保存标题", got)
+	}
+	if got := loadTopicTitleSource(projectRoot, topic.ID); got != topicTitleSourceManual {
+		t.Fatalf("title source = %q, want manual", got)
+	}
+}
+
+func TestOpenProjectTabRecoversMissingTopicTitleFromSessionTitle(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := robustTempDir(t)
+	app := NewApp()
+	topic, err := app.CreateTopic("project", projectRoot, "旧标题")
+	if err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	dir := desktopSessionDir(projectRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	sessionPath := writeTopicSessionWithPrompt(t, dir, "stored-session-title.jsonl", topic.ID, "", projectRoot, "first prompt should not win", time.Now())
+	if err := setSessionTitle(dir, sessionPath, "历史手动标题"); err != nil {
+		t.Fatalf("set session title: %v", err)
+	}
+	if err := os.Remove(topicTitlesPath(projectRoot)); err != nil {
+		t.Fatalf("remove topic titles: %v", err)
+	}
+	if got := loadTopicTitleSource(projectRoot, topic.ID); got != topicTitleSourceManual {
+		t.Fatalf("precondition title source = %q, want manual", got)
+	}
+
+	meta, err := app.OpenProjectTab(projectRoot, topic.ID)
+	if err != nil {
+		t.Fatalf("open project tab: %v", err)
+	}
+	waitForTabReady(t, app, meta.ID)
+	if got := meta.TopicTitle; got != "历史手动标题" {
+		t.Fatalf("opened topic title = %q, want 历史手动标题", got)
+	}
+	if got := loadTopicTitle(projectRoot, topic.ID); got != "历史手动标题" {
+		t.Fatalf("stored topic title = %q, want 历史手动标题", got)
+	}
+	if got := loadTopicTitleSource(projectRoot, topic.ID); got != topicTitleSourceManual {
+		t.Fatalf("title source = %q, want manual", got)
+	}
+}
+
+func TestOpenProjectTabPreservesManualDefaultTopicTitle(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := robustTempDir(t)
+	app := NewApp()
+	topic, err := app.CreateTopic("project", projectRoot, "")
+	if err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := app.RenameTopic(topic.ID, defaultTopicTitle); err != nil {
+		t.Fatalf("rename topic: %v", err)
+	}
+	dir := desktopSessionDir(projectRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	writeTopicSessionWithPrompt(t, dir, "manual-default.jsonl", topic.ID, defaultTopicTitle, projectRoot, "first prompt should not replace manual default", time.Now())
+
+	meta, err := app.OpenProjectTab(projectRoot, topic.ID)
+	if err != nil {
+		t.Fatalf("open project tab: %v", err)
+	}
+	waitForTabReady(t, app, meta.ID)
+	if got := meta.TopicTitle; got != defaultTopicTitle {
+		t.Fatalf("opened topic title = %q, want %q", got, defaultTopicTitle)
+	}
+	if got := loadTopicTitle(projectRoot, topic.ID); got != defaultTopicTitle {
+		t.Fatalf("stored topic title = %q, want %q", got, defaultTopicTitle)
+	}
+	if got := loadTopicTitleSource(projectRoot, topic.ID); got != topicTitleSourceManual {
+		t.Fatalf("title source = %q, want manual", got)
+	}
+}
+
 func TestEnsureTopicIndexedPreservesGlobalAutoTitleSource(t *testing.T) {
 	isolateDesktopUserDirs(t)
 
@@ -1178,6 +1608,25 @@ func TestTrashTopicMovesRelatedSessionsToTrash(t *testing.T) {
 		t.Fatalf("mkdir sessions: %v", err)
 	}
 	sessionPath := writeTopicSession(t, dir, "trash-me.jsonl", topicID, "Trash history", projectRoot)
+	placeholderPath := filepath.Join(dir, "trash-placeholder-session.jsonl")
+	if err := os.WriteFile(placeholderPath, nil, 0o644); err != nil {
+		t.Fatalf("write placeholder session: %v", err)
+	}
+	now := time.Now()
+	if err := agent.SaveBranchMetaPreserveUpdated(placeholderPath, agent.BranchMeta{
+		CreatedAt:     now.Add(-time.Minute),
+		UpdatedAt:     now,
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+		TopicID:       topicID,
+		TopicTitle:    "Trash history",
+	}); err != nil {
+		t.Fatalf("save placeholder branch meta: %v", err)
+	}
+	placeholderGoalPath := strings.TrimSuffix(placeholderPath, ".jsonl") + ".goal-state.json"
+	if err := os.WriteFile(placeholderGoalPath, []byte(`{"done":true}`), 0o644); err != nil {
+		t.Fatalf("write placeholder goal state: %v", err)
+	}
 	ref := "sa_20260102_030405_000000000_aabbccddeeff"
 	writeSubagentArtifact(t, dir, ref, agent.BranchID(sessionPath))
 
@@ -1190,6 +1639,19 @@ func TestTrashTopicMovesRelatedSessionsToTrash(t *testing.T) {
 	trashPath := filepath.Join(dir, sessionTrashDir, "trash-me.jsonl", "trash-me.jsonl")
 	if _, err := os.Stat(trashPath); err != nil {
 		t.Fatalf("topic session should be moved to trash: %v", err)
+	}
+	if _, err := os.Stat(placeholderPath); !os.IsNotExist(err) {
+		t.Fatalf("placeholder session should be removed from active history, stat err = %v", err)
+	}
+	placeholderTrashDir := filepath.Join(dir, sessionTrashDir, "trash-placeholder-session.jsonl")
+	if _, err := os.Stat(filepath.Join(placeholderTrashDir, "trash-placeholder-session.jsonl")); err != nil {
+		t.Fatalf("placeholder session should be moved to trash: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(placeholderTrashDir, "trash-placeholder-session.jsonl.meta")); err != nil {
+		t.Fatalf("placeholder meta should be moved to trash: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(placeholderTrashDir, "trash-placeholder-session.goal-state.json")); err != nil {
+		t.Fatalf("placeholder goal state should be moved to trash: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, sessionTrashDir, "trash-me.jsonl", "subagents", ref+".jsonl")); err != nil {
 		t.Fatalf("topic subagent should be moved to trash: %v", err)
@@ -1494,6 +1956,301 @@ func TestTrashTopicCancelsRunningSessionRuntime(t *testing.T) {
 	}
 }
 
+func TestTrashTopicFallbackCreatesUnindexedBlank(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	topicID := "topic_only"
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := setTopicTitle(projectRoot, topicID, "Only topic"); err != nil {
+		t.Fatalf("set topic title: %v", err)
+	}
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	sessionPath := writeTopicSession(t, dir, "only-topic.jsonl", topicID, "Only topic", projectRoot)
+	ctrl := control.New(control.Options{SessionDir: dir, SessionPath: sessionPath, Label: "test", WorkspaceRoot: projectRoot})
+	defer ctrl.Close()
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"only": {
+				ID:            "only",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicID:       topicID,
+				TopicTitle:    "Only topic",
+				Ctrl:          ctrl,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+		},
+		tabOrder:    []string{"only"},
+		activeTabID: "only",
+	}
+
+	if err := app.TrashTopic(topicID); err != nil {
+		t.Fatalf("TrashTopic: %v", err)
+	}
+	if len(app.tabs) != 1 {
+		t.Fatalf("fallback should create exactly one visible tab, got %d", len(app.tabs))
+	}
+	for id, tab := range app.tabs {
+		if strings.TrimSpace(tab.TopicID) != "" {
+			t.Fatalf("fallback tab %q topic ID = %q, want transient unindexed blank", id, tab.TopicID)
+		}
+		if strings.TrimSpace(tab.SessionPath) == "" {
+			t.Fatalf("fallback tab %q has no precreated session path", id)
+		}
+		f := loadProjectsFile()
+		if len(f.Projects) != 1 || containsDesktopString(f.Projects[0].Topics, topicID) {
+			t.Fatalf("deleted topic %q should be removed without indexing a replacement: %#v", topicID, f.Projects)
+		}
+	}
+	nodes := app.ListProjectTree()
+	if len(nodes) != 1 || len(nodes[0].Children) != 0 {
+		t.Fatalf("transient fallback blank should stay out of project tree: %+v", nodes)
+	}
+}
+
+func TestTransientFallbackIndexesOnFirstUserTurn(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	topicID := "topic_only"
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := setTopicTitle(projectRoot, topicID, "Only topic"); err != nil {
+		t.Fatalf("set topic title: %v", err)
+	}
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	sessionPath := writeTopicSession(t, dir, "only-topic.jsonl", topicID, "Only topic", projectRoot)
+	ctrl := control.New(control.Options{SessionDir: dir, SessionPath: sessionPath, Label: "test", WorkspaceRoot: projectRoot})
+	defer ctrl.Close()
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"only": {
+				ID:            "only",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicID:       topicID,
+				TopicTitle:    "Only topic",
+				Ctrl:          ctrl,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+		},
+		tabOrder:    []string{"only"},
+		activeTabID: "only",
+	}
+
+	if err := app.TrashTopic(topicID); err != nil {
+		t.Fatalf("TrashTopic: %v", err)
+	}
+	var fallback *WorkspaceTab
+	for _, tab := range app.tabs {
+		fallback = tab
+	}
+	if fallback == nil {
+		t.Fatal("fallback tab missing")
+	}
+	if fallback.TopicID != "" {
+		t.Fatalf("fallback topic before first turn = %q, want empty", fallback.TopicID)
+	}
+
+	app.ensureTabTopicIndexedForUserTurn(fallback)
+	if strings.TrimSpace(fallback.TopicID) == "" {
+		t.Fatal("first user turn should assign a topic ID")
+	}
+	f := loadProjectsFile()
+	if len(f.Projects) != 1 || !containsDesktopString(f.Projects[0].Topics, fallback.TopicID) {
+		t.Fatalf("first user turn should index fallback topic %q: %#v", fallback.TopicID, f.Projects)
+	}
+	meta, ok, err := agent.LoadBranchMeta(fallback.SessionPath)
+	if err != nil || !ok {
+		t.Fatalf("LoadBranchMeta(%q): ok=%v err=%v", fallback.SessionPath, ok, err)
+	}
+	if meta.TopicID != fallback.TopicID || meta.TopicTitle != defaultTopicTitle {
+		t.Fatalf("fallback session meta = %+v, want topic %q title %q", meta, fallback.TopicID, defaultTopicTitle)
+	}
+}
+
+func TestTransientFallbackDiscardedWhenSingleSurfaceNavigatesAway(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	dir := desktopSessionDir(projectRoot)
+	transientPath, err := createEmptySessionFile(dir, "test")
+	if err != nil {
+		t.Fatalf("create transient session: %v", err)
+	}
+	if err := agent.SaveBranchMetaPreserveUpdated(transientPath, agent.BranchMeta{
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+	}); err != nil {
+		t.Fatalf("save transient meta: %v", err)
+	}
+
+	targetTopicID := "topic_target"
+	if err := setTopicTitle(projectRoot, targetTopicID, "Target"); err != nil {
+		t.Fatalf("set target topic title: %v", err)
+	}
+	targetPath := writeTopicSession(t, dir, "target.jsonl", targetTopicID, "Target", projectRoot)
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"transient": {
+				ID:            "transient",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicTitle:    defaultTopicTitle,
+				SessionPath:   transientPath,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+			"target": {
+				ID:            "target",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicID:       targetTopicID,
+				TopicTitle:    "Target",
+				SessionPath:   targetPath,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+		},
+		tabOrder:    []string{"transient", "target"},
+		activeTabID: "transient",
+	}
+
+	if _, err := app.keepOnlyVisibleTab("target"); err != nil {
+		t.Fatalf("keepOnlyVisibleTab: %v", err)
+	}
+	if _, ok := app.tabs["transient"]; ok {
+		t.Fatal("transient tab should be removed after single-surface navigation")
+	}
+	if _, err := os.Stat(transientPath); !os.IsNotExist(err) {
+		t.Fatalf("transient session artifact should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(agent.BranchMetaPath(transientPath)); !os.IsNotExist(err) {
+		t.Fatalf("transient session meta should be removed, stat err = %v", err)
+	}
+	f := loadProjectsFile()
+	if len(f.Projects) != 1 || containsDesktopString(f.Projects[0].Topics, "") {
+		t.Fatalf("transient blank should not be indexed in project topics: %#v", f.Projects)
+	}
+}
+
+func TestCloseTabDiscardsUnusedTransientBlankSession(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	dir := desktopSessionDir(projectRoot)
+	transientPath, err := createEmptySessionFile(dir, "test")
+	if err != nil {
+		t.Fatalf("create transient session: %v", err)
+	}
+	if err := agent.SaveBranchMetaPreserveUpdated(transientPath, agent.BranchMeta{
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+	}); err != nil {
+		t.Fatalf("save transient meta: %v", err)
+	}
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"transient": {
+				ID:            "transient",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicTitle:    defaultTopicTitle,
+				SessionPath:   transientPath,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+			"other": {
+				ID:          "other",
+				Scope:       "global",
+				TopicID:     "topic_other",
+				TopicTitle:  "Other",
+				Ready:       true,
+				disabledMCP: map[string]ServerView{},
+			},
+		},
+		tabOrder:    []string{"transient", "other"},
+		activeTabID: "transient",
+	}
+
+	if err := app.CloseTab("transient"); err != nil {
+		t.Fatalf("CloseTab: %v", err)
+	}
+	if _, ok := app.tabs["transient"]; ok {
+		t.Fatal("transient tab should be closed")
+	}
+	if _, err := os.Stat(transientPath); !os.IsNotExist(err) {
+		t.Fatalf("transient session artifact should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(agent.BranchMetaPath(transientPath)); !os.IsNotExist(err) {
+		t.Fatalf("transient session meta should be removed, stat err = %v", err)
+	}
+}
+
+func TestCloseTabKeepsIndexedBlankSession(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	topicID := "topic_indexed_blank"
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := setTopicTitle(projectRoot, topicID, defaultTopicTitle); err != nil {
+		t.Fatalf("set topic title: %v", err)
+	}
+	dir := desktopSessionDir(projectRoot)
+	indexedPath, err := createEmptySessionFile(dir, "test")
+	if err != nil {
+		t.Fatalf("create indexed blank session: %v", err)
+	}
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"indexed": {
+				ID:            "indexed",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicID:       topicID,
+				TopicTitle:    defaultTopicTitle,
+				SessionPath:   indexedPath,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+			"other": {
+				ID:          "other",
+				Scope:       "global",
+				TopicID:     "topic_other",
+				TopicTitle:  "Other",
+				Ready:       true,
+				disabledMCP: map[string]ServerView{},
+			},
+		},
+		tabOrder:    []string{"indexed", "other"},
+		activeTabID: "indexed",
+	}
+
+	if err := app.CloseTab("indexed"); err != nil {
+		t.Fatalf("CloseTab: %v", err)
+	}
+	if _, err := os.Stat(indexedPath); err != nil {
+		t.Fatalf("indexed blank session should be preserved, stat err = %v", err)
+	}
+}
+
 func TestTrashTopicTrashConflictKeepsRunningRuntime(t *testing.T) {
 	isolateDesktopUserDirs(t)
 
@@ -1536,21 +2293,81 @@ func TestTrashTopicTrashConflictKeepsRunningRuntime(t *testing.T) {
 	ctrl.Submit("long turn")
 	<-runner.started
 	err := app.TrashTopic(topicID)
-	if err == nil || !strings.Contains(err.Error(), "already exists in trash") {
-		t.Fatalf("TrashTopic conflict error = %v, want trash conflict", err)
+	if err != nil {
+		t.Fatalf("TrashTopic should succeed after cleaning empty trash dir: %v", err)
 	}
-	if _, ok := app.tabs["running"]; !ok {
-		t.Fatalf("running runtime should remain bound after preflight failure")
-	}
-	if !ctrl.Running() {
-		t.Fatalf("running turn should not be cancelled on preflight failure")
-	}
-	if _, err := os.Stat(sessionPath); err != nil {
-		t.Fatalf("session file should remain after preflight failure: %v", err)
+	if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
+		t.Fatalf("session file should be moved to trash, stat err = %v", err)
 	}
 
 	close(runner.release)
 	waitNotRunning(t, ctrl)
+}
+
+func TestTrashTopicValidTrashRemovesEmptyLiveStub(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	topicID := "topic_valid_trash"
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := setTopicTitle(projectRoot, topicID, "Valid trash"); err != nil {
+		t.Fatalf("set topic title: %v", err)
+	}
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	sessionPath := filepath.Join(dir, "valid-trash.jsonl")
+	if err := os.WriteFile(sessionPath, nil, 0o644); err != nil {
+		t.Fatalf("write live stub: %v", err)
+	}
+	if err := agent.SaveBranchMeta(sessionPath, agent.BranchMeta{
+		CreatedAt:     time.Now().Add(-time.Minute),
+		UpdatedAt:     time.Now(),
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+		TopicID:       topicID,
+		TopicTitle:    "Valid trash",
+	}); err != nil {
+		t.Fatalf("save branch meta: %v", err)
+	}
+	trashPath := filepath.Join(dir, sessionTrashDir, filepath.Base(sessionPath), filepath.Base(sessionPath))
+	if err := os.MkdirAll(filepath.Dir(trashPath), 0o755); err != nil {
+		t.Fatalf("create trash dir: %v", err)
+	}
+	if err := os.WriteFile(trashPath, []byte(`{"role":"user","content":"already trashed"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write trash session: %v", err)
+	}
+
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"stale": {
+				ID:            "stale",
+				Scope:         "project",
+				WorkspaceRoot: projectRoot,
+				TopicID:       topicID,
+				TopicTitle:    "Valid trash",
+				SessionPath:   sessionPath,
+				Ready:         true,
+				disabledMCP:   map[string]ServerView{},
+			},
+			"other": {ID: "other", Scope: "project", WorkspaceRoot: projectRoot, TopicID: "other", Ready: true},
+		},
+		tabOrder:    []string{"stale", "other"},
+		activeTabID: "other",
+	}
+
+	if err := app.TrashTopic(topicID); err != nil {
+		t.Fatalf("TrashTopic should remove stale live stub: %v", err)
+	}
+	if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
+		t.Fatalf("live stub should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(trashPath); err != nil {
+		t.Fatalf("existing trash should remain authoritative: %v", err)
+	}
 }
 
 func hasHistoryContent(messages []HistoryMessage, content string) bool {
@@ -1588,6 +2405,86 @@ func TestLegacyMigrationSkipsProjectScopedSessions(t *testing.T) {
 	}
 	if got.Scope != "project" || got.WorkspaceRoot != meta.WorkspaceRoot {
 		t.Fatalf("project-scoped legacy session must not be forced into Global: %+v", got)
+	}
+}
+
+func TestProjectTreeMigratesCLISessionFromProjectDir(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	dir := config.ProjectSessionDir(projectRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := writeLegacySession(t, dir, "cli-project.jsonl", "cli project prompt", time.Now())
+	wantTopicID := legacySessionTopicID(sessionPath)
+
+	nodes := NewApp().ListProjectTree()
+	if len(nodes) != 1 || nodes[0].Kind != "project" || len(nodes[0].Children) != 1 || nodes[0].Children[0].TopicID != wantTopicID {
+		t.Fatalf("project CLI session should appear in project tree, got %#v; want topic %q", nodes, wantTopicID)
+	}
+}
+
+func TestProjectTreeMigratesNewCLISessionAfterProjectDirMarker(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	if err := addProject(projectRoot, ""); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	dir := config.ProjectSessionDir(projectRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := writeLegacySession(t, dir, "first-cli-project.jsonl", "first cli project prompt", time.Now().Add(-time.Hour))
+	firstTopicID := legacySessionTopicID(first)
+
+	nodes := NewApp().ListProjectTree()
+	if len(nodes) != 1 || nodes[0].Kind != "project" || len(nodes[0].Children) != 1 || nodes[0].Children[0].TopicID != firstTopicID {
+		t.Fatalf("first project CLI session should appear in project tree, got %#v; want topic %q", nodes, firstTopicID)
+	}
+	if _, err := os.Stat(filepath.Join(dir, topicMigrationMarker)); err != nil {
+		t.Fatalf("expected migration marker after first project pass: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	second := writeLegacySession(t, dir, "second-cli-project.jsonl", "second cli project prompt", time.Now())
+	secondTopicID := legacySessionTopicID(second)
+
+	nodes = NewApp().ListProjectTree()
+	if len(nodes) != 1 || nodes[0].Kind != "project" || len(nodes[0].Children) != 2 {
+		t.Fatalf("second project CLI session should trigger re-scan, got %#v", nodes)
+	}
+	if nodes[0].Children[0].TopicID != secondTopicID || nodes[0].Children[1].TopicID != firstTopicID {
+		t.Fatalf("project CLI topics = %#v, want newest %q then %q", nodes[0].Children, secondTopicID, firstTopicID)
+	}
+}
+
+func TestProjectTreeMigratesCLISessionFromGlobalWorkspaceDir(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	globalRoot := globalWorkspaceRoot()
+	dir := desktopSessionDir(globalRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := writeLegacySession(t, dir, "cli-global.jsonl", "cli global prompt", time.Now())
+	if err := agent.SaveBranchMetaPreserveUpdated(sessionPath, agent.BranchMeta{
+		CreatedAt:     time.Now().Add(-time.Minute),
+		UpdatedAt:     time.Now(),
+		Scope:         "global",
+		WorkspaceRoot: globalRoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantTopicID := legacySessionTopicID(sessionPath)
+
+	nodes := NewApp().ListProjectTree()
+	if len(nodes) != 1 || nodes[0].Kind != "global_folder" || len(nodes[0].Children) != 1 || nodes[0].Children[0].TopicID != wantTopicID {
+		t.Fatalf("global workspace CLI session should appear in Global, got %#v; want topic %q", nodes, wantTopicID)
 	}
 }
 
@@ -1663,6 +2560,73 @@ func TestFindTopicSessionIndexRefreshesWhenMetaChanges(t *testing.T) {
 	}
 	if got := findTopicSession(dir, "topic_cache_other"); got != second {
 		t.Fatalf("lookup for retopic session = %q, want %q", got, second)
+	}
+}
+
+func TestFindTopicSessionSkipsCleanupPending(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	topicID := "topic_skip_pending"
+	now := time.Now().UTC()
+	normal := writeTopicSessionWithPrompt(t, dir, "normal.jsonl", topicID, "Normal", "", "normal prompt", now)
+	pending := writeTopicSessionWithPrompt(t, dir, "pending.jsonl", topicID, "Pending", "", "pending prompt", now.Add(time.Hour))
+
+	if got := findTopicSession(dir, topicID); got != pending {
+		t.Fatalf("pre-marker lookup = %q, want newest pending %q", got, pending)
+	}
+	if err := agent.MarkCleanupPending(pending, "delete"); err != nil {
+		t.Fatal(err)
+	}
+	if got := findTopicSession(dir, topicID); got != normal {
+		t.Fatalf("lookup with cleanup-pending newest = %q, want normal %q", got, normal)
+	}
+	if err := agent.MarkCleanupPending(normal, "delete"); err != nil {
+		t.Fatal(err)
+	}
+	if got := findTopicSession(dir, topicID); got != "" {
+		t.Fatalf("lookup with only cleanup-pending sessions = %q, want empty", got)
+	}
+}
+
+func TestOpenProjectTabSkipsCleanupPendingTopicSession(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	projectRoot := t.TempDir()
+	app := NewApp()
+	topic, err := app.CreateTopic("project", projectRoot, "Pending topic")
+	if err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	dir := desktopSessionDir(projectRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pending := writeTopicSessionWithPrompt(t, dir, "pending-topic.jsonl", topic.ID, "Pending topic", projectRoot, "pending topic prompt", time.Now())
+	if err := agent.MarkCleanupPending(pending, "delete"); err != nil {
+		t.Fatal(err)
+	}
+	if got := findTopicSession(dir, topic.ID); got != "" {
+		t.Fatalf("topic lookup with only cleanup-pending session = %q, want empty", got)
+	}
+	if got, _ := app.findTopicSessionForTarget("project", projectRoot, topic.ID); got != "" {
+		t.Fatalf("target topic lookup with only cleanup-pending session = %q, want empty", got)
+	}
+
+	meta, err := app.OpenProjectTab(projectRoot, topic.ID)
+	if err != nil {
+		t.Fatalf("open project tab: %v", err)
+	}
+	tab := waitForTabReady(t, app, meta.ID)
+	if got := filepath.Clean(tab.Ctrl.SessionPath()); got == filepath.Clean(pending) {
+		t.Fatalf("opened cleanup-pending topic session path %q", got)
+	}
+	for _, msg := range tab.Ctrl.History() {
+		if msg.Content == "pending topic prompt" {
+			t.Fatalf("opened cleanup-pending topic history at path %q: %+v", tab.Ctrl.SessionPath(), tab.Ctrl.History())
+		}
 	}
 }
 

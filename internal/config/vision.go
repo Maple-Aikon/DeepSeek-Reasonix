@@ -60,11 +60,14 @@ func modelTokenSeparator(r rune) bool {
 
 // EffectiveVision resolves whether the selected model accepts image input.
 // Explicit provider vision still wins for custom vision-capable gateways; the
-// built-in MiMo heuristic is deliberately limited to official MiMo endpoints so
+// MiMo endpoint heuristic is deliberately limited to known MiMo endpoints so
 // arbitrary OpenAI-compatible proxies do not get image payloads unexpectedly.
 func EffectiveVision(e *ProviderEntry) bool {
 	if e == nil {
 		return false
+	}
+	if e.visionOverride != nil {
+		return *e.visionOverride
 	}
 	if e.Vision {
 		return true

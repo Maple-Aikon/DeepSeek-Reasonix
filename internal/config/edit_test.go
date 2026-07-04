@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -13,11 +14,11 @@ import (
 
 func TestSetDefaultModel(t *testing.T) {
 	c := Default()
-	if err := c.SetDefaultModel("mimo-pro"); err != nil {
+	if err := c.SetDefaultModel("deepseek-pro"); err != nil {
 		t.Fatalf("set valid default: %v", err)
 	}
-	if c.DefaultModel != "mimo-pro" {
-		t.Errorf("default = %q, want mimo-pro", c.DefaultModel)
+	if c.DefaultModel != "deepseek-pro" {
+		t.Errorf("default = %q, want deepseek-pro", c.DefaultModel)
 	}
 	if err := c.SetDefaultModel("nope"); err == nil {
 		t.Error("expected error for unknown provider")
@@ -25,13 +26,13 @@ func TestSetDefaultModel(t *testing.T) {
 	// "provider/model" form is also accepted: the /model picker stores the
 	// full ref so a user can land on a non-default model under the same
 	// provider across restarts.
-	if err := c.SetDefaultModel("mimo-pro/mimo-v2.5-pro"); err != nil {
+	if err := c.SetDefaultModel("deepseek-pro/deepseek-v4-pro"); err != nil {
 		t.Fatalf("set provider/model default: %v", err)
 	}
-	if c.DefaultModel != "mimo-pro/mimo-v2.5-pro" {
-		t.Errorf("default = %q, want mimo-pro/mimo-v2.5-pro", c.DefaultModel)
+	if c.DefaultModel != "deepseek-pro/deepseek-v4-pro" {
+		t.Errorf("default = %q, want deepseek-pro/deepseek-v4-pro", c.DefaultModel)
 	}
-	if err := c.SetDefaultModel("mimo-pro/missing"); err == nil {
+	if err := c.SetDefaultModel("deepseek-pro/missing"); err == nil {
 		t.Error("expected error for unknown model under known provider")
 	}
 	if err := c.SetDefaultModel(""); err == nil {
@@ -73,6 +74,25 @@ func TestUIThemeStyleNormalizes(t *testing.T) {
 		c.UI.ThemeStyle = tt.in
 		if got := c.UIThemeStyle(); got != tt.want {
 			t.Errorf("UIThemeStyle(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestUICursorShapeNormalizes(t *testing.T) {
+	c := Default()
+	for _, tt := range []struct {
+		in   string
+		want string
+	}{
+		{"", "underline"},
+		{"UNDERLINE", "underline"},
+		{" block ", "block"},
+		{"bar", "bar"},
+		{"unknown", "underline"},
+	} {
+		c.UI.CursorShape = tt.in
+		if got := c.UICursorShape(); got != tt.want {
+			t.Errorf("UICursorShape(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }
@@ -161,6 +181,8 @@ func TestDesktopLayoutStyleNormalizes(t *testing.T) {
 		{"classic", "classic", false},
 		{" workbench ", "workbench", false},
 		{"workspace", "workbench", false},
+		{"creation", "creation", false},
+		{" Creation ", "creation", false},
 		{"later", "workbench", true},
 	} {
 		c := Default()
@@ -317,6 +339,68 @@ func TestSetAutoPlan(t *testing.T) {
 	}
 	if err := c.SetAutoPlan("auto"); err == nil {
 		t.Fatal("expected error for invalid auto_plan mode")
+	}
+}
+
+func TestSetDesktopDefaultToolApprovalMode(t *testing.T) {
+	c := Default()
+	for _, mode := range []string{"ask", "auto", "yolo"} {
+		if err := c.SetDesktopDefaultToolApprovalMode(mode); err != nil {
+			t.Fatalf("SetDesktopDefaultToolApprovalMode(%q): %v", mode, err)
+		}
+		if c.DesktopDefaultToolApprovalMode() != mode {
+			t.Fatalf("desktop default tool approval mode = %q, want %q", c.DesktopDefaultToolApprovalMode(), mode)
+		}
+	}
+	if err := c.SetDesktopDefaultToolApprovalMode("full-access"); err != nil {
+		t.Fatalf("legacy full-access should be accepted: %v", err)
+	}
+	if c.DesktopDefaultToolApprovalMode() != "yolo" {
+		t.Fatalf("legacy full-access should save as yolo, got %q", c.DesktopDefaultToolApprovalMode())
+	}
+	if err := c.SetDesktopDefaultToolApprovalMode("maybe"); err == nil {
+		t.Fatal("expected error for invalid desktop default tool approval mode")
+	}
+}
+
+func TestSetMemoryCompilerEnabled(t *testing.T) {
+	c := Default()
+	if err := c.SetMemoryCompilerEnabled(false); err != nil {
+		t.Fatalf("SetMemoryCompilerEnabled(false): %v", err)
+	}
+	if c.MemoryCompilerEnabled() {
+		t.Fatal("memory compiler explicit false = true, want false")
+	}
+	if err := c.SetMemoryCompilerEnabled(true); err != nil {
+		t.Fatalf("SetMemoryCompilerEnabled(true): %v", err)
+	}
+	if !c.MemoryCompilerEnabled() {
+		t.Fatal("memory compiler explicit true = false, want true")
+	}
+}
+
+func TestSetMemoryCompilerVerbosity(t *testing.T) {
+	c := Default()
+	if err := c.SetMemoryCompilerVerbosity("compact"); err != nil {
+		t.Fatalf("SetMemoryCompilerVerbosity(compact): %v", err)
+	}
+	if got := c.MemoryCompilerVerbosity(); got != MemoryCompilerVerbosityCompact {
+		t.Fatalf("memory compiler verbosity = %q, want compact", got)
+	}
+	if err := c.SetMemoryCompilerVerbosity("on"); err != nil {
+		t.Fatalf("SetMemoryCompilerVerbosity(on): %v", err)
+	}
+	if got := c.MemoryCompilerVerbosity(); got != MemoryCompilerVerbosityCompact {
+		t.Fatalf("memory compiler verbosity after on = %q, want compact", got)
+	}
+	if err := c.SetMemoryCompilerVerbosity("observe"); err != nil {
+		t.Fatalf("SetMemoryCompilerVerbosity(observe): %v", err)
+	}
+	if got := c.MemoryCompilerVerbosity(); got != MemoryCompilerVerbosityObserve {
+		t.Fatalf("memory compiler verbosity = %q, want observe", got)
+	}
+	if err := c.SetMemoryCompilerVerbosity("verbose"); err == nil {
+		t.Fatal("expected error for invalid memory compiler verbosity")
 	}
 }
 
@@ -525,8 +609,9 @@ func TestResolveModelPreservesProviderEffort(t *testing.T) {
 	}
 }
 
-func TestEffectiveVisionForOfficialMimoModels(t *testing.T) {
+func TestEffectiveVisionForMimoEndpointModels(t *testing.T) {
 	c := Default()
+	c.Providers = append(c.Providers, legacyMimoCustomProvider("mimo-api"))
 	c.Desktop.ProviderAccess = []string{"mimo-api"}
 	normalizeDesktopOfficialProviderAccess(c)
 
@@ -600,6 +685,50 @@ func TestEffectiveVisionUsesPerModelVisionList(t *testing.T) {
 	textOnly.Vision = true
 	if !EffectiveVision(textOnly) {
 		t.Fatalf("provider-level vision=true should still enable every selected model")
+	}
+}
+
+func TestResolveModelAppliesModelOverrides(t *testing.T) {
+	visionOff := false
+	c := &Config{Providers: []ProviderEntry{{
+		Name:              "gateway",
+		Kind:              "openai",
+		BaseURL:           "https://proxy.example.com/v1",
+		Models:            []string{"deepseek-v4-flash", "plain-chat"},
+		Default:           "plain-chat",
+		ReasoningProtocol: ReasoningProtocolOpenAI,
+		SupportedEfforts:  []string{"low", "medium", "high"},
+		ModelOverrides: map[string]ProviderModelOverride{
+			"deepseek-v4-flash": {
+				ReasoningProtocol: ReasoningProtocolDeepSeek,
+				SupportedEfforts:  []string{"high", "max"},
+				DefaultEffort:     "max",
+				Vision:            &visionOff,
+			},
+		},
+	}}}
+
+	deepseek, ok := c.ResolveModel("gateway/deepseek-v4-flash")
+	if !ok {
+		t.Fatal("ResolveModel did not find gateway/deepseek-v4-flash")
+	}
+	if protocol := ReasoningProtocolForEntry(deepseek); protocol != ReasoningProtocolDeepSeek {
+		t.Fatalf("deepseek protocol = %q, want deepseek", protocol)
+	}
+	cap := EffortCapabilityForEntry(deepseek)
+	if cap.Default != "max" || !containsString(cap.Levels, "max") || containsString(cap.Levels, "low") {
+		t.Fatalf("deepseek effort capability = %+v, want high|max default max", cap)
+	}
+	if EffectiveVision(deepseek) {
+		t.Fatalf("vision override false should disable image input")
+	}
+
+	plain, ok := c.ResolveModel("gateway/plain-chat")
+	if !ok {
+		t.Fatal("ResolveModel did not find gateway/plain-chat")
+	}
+	if protocol := ReasoningProtocolForEntry(plain); protocol != ReasoningProtocolOpenAI {
+		t.Fatalf("plain protocol = %q, want provider-level openai", protocol)
 	}
 }
 
@@ -769,6 +898,15 @@ func TestPluginMutators(t *testing.T) {
 	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Type: "carrier-pigeon", Command: "x"}); err == nil {
 		t.Error("unknown transport should error")
 	}
+	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", CallTimeoutSeconds: -1}); err == nil {
+		t.Error("negative call_timeout_seconds should error")
+	}
+	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", ToolTimeoutSeconds: map[string]int{"generate": -1}}); err == nil {
+		t.Error("negative tool_timeout_seconds should error")
+	}
+	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", ToolTimeoutSeconds: map[string]int{" ": 1}}); err == nil {
+		t.Error("empty tool_timeout_seconds key should error")
+	}
 
 	// Replace in place.
 	if err := c.UpsertPlugin(PluginEntry{Name: "ex", Command: "other-cmd"}); err != nil {
@@ -808,10 +946,10 @@ func TestPluginResolvedTierDefaultsToBackground(t *testing.T) {
 		want string
 	}{
 		{name: "empty", tier: "", want: "background"},
-		{name: "explicit lazy", tier: "lazy", want: "lazy"},
+		{name: "legacy lazy", tier: "lazy", want: "background"},
 		{name: "background", tier: "background", want: "background"},
 		{name: "eager", tier: "eager", want: "eager"},
-		{name: "unknown", tier: "startup", want: "lazy"},
+		{name: "unknown", tier: "startup", want: "background"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := (PluginEntry{Name: "mcp", Command: "mcp-server", Tier: tc.tier}).ResolvedTier()
@@ -866,7 +1004,7 @@ func TestClearPluginAuthentication(t *testing.T) {
 // re-decodes the file to confirm the changes survived a write/read cycle.
 func TestSaveToRoundTrips(t *testing.T) {
 	c := Default()
-	if err := c.SetDefaultModel("mimo-pro"); err != nil {
+	if err := c.SetDefaultModel("deepseek-pro"); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.SetPlannerModel("deepseek-pro"); err != nil {
@@ -905,7 +1043,7 @@ func TestSaveToRoundTrips(t *testing.T) {
 	if _, err := toml.DecodeFile(path, &got); err != nil {
 		t.Fatalf("saved file does not parse: %v", err)
 	}
-	if got.DefaultModel != "mimo-pro" {
+	if got.DefaultModel != "deepseek-pro" {
 		t.Errorf("default_model = %q", got.DefaultModel)
 	}
 	if got.Agent.PlannerModel != "deepseek-pro" {
@@ -949,6 +1087,11 @@ func TestSaveToScopesUserAndProjectFiles(t *testing.T) {
 	if !strings.Contains(string(userBody), "[desktop]") {
 		t.Fatalf("user config should include desktop preferences:\n%s", userBody)
 	}
+	if info, err := os.Stat(userPath); err != nil {
+		t.Fatalf("stat user config: %v", err)
+	} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("user config mode = %o, want 600", info.Mode().Perm())
+	}
 
 	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
 	if err := c.SaveTo(projectPath); err != nil {
@@ -958,8 +1101,15 @@ func TestSaveToScopesUserAndProjectFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read project config: %v", err)
 	}
-	if strings.Contains(string(projectBody), "[desktop]") || strings.Contains(string(projectBody), "close_behavior") {
+	if strings.Contains(string(projectBody), "[desktop]") ||
+		strings.Contains(string(projectBody), "close_behavior") ||
+		strings.Contains(string(projectBody), "default_tool_approval_mode") {
 		t.Fatalf("project config should not include desktop preferences:\n%s", projectBody)
+	}
+	if info, err := os.Stat(projectPath); err != nil {
+		t.Fatalf("stat project config: %v", err)
+	} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o644 {
+		t.Fatalf("project config mode = %o, want 644", info.Mode().Perm())
 	}
 }
 
@@ -1070,6 +1220,67 @@ api_key_env = "PROJECT_ONLY_KEY"
 	}
 }
 
+func TestLoadForRootKeepsGlobalAgentStepLimitsOverProject(t *testing.T) {
+	isolateUserConfigHome(t)
+	root := t.TempDir()
+	userPath := UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte(`
+[agent]
+max_steps = 17
+planner_max_steps = 9
+temperature = 0.4
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "reasonix.toml"), []byte(`
+default_model = "deepseek-pro"
+
+[agent]
+max_steps = 3
+planner_max_steps = 4
+temperature = 0.8
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadForRoot(root)
+	if err != nil {
+		t.Fatalf("LoadForRoot: %v", err)
+	}
+	if cfg.Agent.MaxSteps != 17 || cfg.Agent.PlannerMaxSteps != 9 {
+		t.Fatalf("agent steps = max:%d planner:%d, want global 17/9", cfg.Agent.MaxSteps, cfg.Agent.PlannerMaxSteps)
+	}
+	if cfg.Agent.Temperature != 0.8 {
+		t.Fatalf("agent temperature = %v, want project override to keep working for other agent settings", cfg.Agent.Temperature)
+	}
+	if cfg.DefaultModel != "deepseek-pro" {
+		t.Fatalf("default_model = %q, want project config to keep overriding unrelated fields", cfg.DefaultModel)
+	}
+}
+
+func TestLoadForRootIgnoresProjectAgentStepLimitsWithoutUserConfig(t *testing.T) {
+	isolateUserConfigHome(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "reasonix.toml"), []byte(`
+[agent]
+max_steps = 3
+planner_max_steps = 4
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadForRoot(root)
+	if err != nil {
+		t.Fatalf("LoadForRoot: %v", err)
+	}
+	if cfg.Agent.MaxSteps != 0 || cfg.Agent.PlannerMaxSteps != 0 {
+		t.Fatalf("agent steps = max:%d planner:%d, want built-in global defaults 0/0", cfg.Agent.MaxSteps, cfg.Agent.PlannerMaxSteps)
+	}
+}
+
 func TestSaveForRootPreservesShadowedProjectProvider(t *testing.T) {
 	isolateUserConfigHome(t)
 	root := t.TempDir()
@@ -1176,6 +1387,105 @@ api_key_env = "PROJECT_KEY"
 	}
 	if _, ok := got.Provider("project-local"); !ok {
 		t.Fatalf("project provider missing after save: %+v", got.Providers)
+	}
+}
+
+func TestSaveToExistingProjectPersistsTopLevelDelta(t *testing.T) {
+	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[permissions]\nallow = [\"Bash(go test:*)\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.ConfigVersion = 2
+	if err := cfg.SetDefaultModel("deepseek-pro"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if !strings.Contains(string(body), `default_model = "deepseek-pro"`) {
+		t.Fatalf("project config dropped top-level default_model delta:\n%s", body)
+	}
+	if !strings.Contains(string(body), "config_version = 2") {
+		t.Fatalf("project config dropped top-level config_version delta:\n%s", body)
+	}
+	var got Config
+	if _, err := toml.DecodeFile(projectPath, &got); err != nil {
+		t.Fatalf("saved project config does not parse: %v", err)
+	}
+	if got.DefaultModel != "deepseek-pro" {
+		t.Fatalf("default_model = %q, want deepseek-pro", got.DefaultModel)
+	}
+	if got.ConfigVersion != 2 {
+		t.Fatalf("config_version = %d, want 2", got.ConfigVersion)
+	}
+}
+
+func TestSaveToExistingProjectRemovesPluginDelta(t *testing.T) {
+	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
+	cfg := Default()
+	if err := cfg.UpsertPlugin(PluginEntry{Name: "ed", Type: "http", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"Authorization": "Bearer token"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("initial SaveTo: %v", err)
+	}
+	if !cfg.RemovePlugin("ed") {
+		t.Fatal("RemovePlugin should report changed")
+	}
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo after remove: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if strings.Contains(string(body), "[[plugins]]") || strings.Contains(string(body), "[plugins.headers]") || strings.Contains(string(body), "Authorization") {
+		t.Fatalf("removed plugin should not remain in project config:\n%s", body)
+	}
+	var got Config
+	if _, err := toml.DecodeFile(projectPath, &got); err != nil {
+		t.Fatalf("saved project config does not parse: %v", err)
+	}
+	if len(got.Plugins) != 0 {
+		t.Fatalf("plugins = %+v, want none", got.Plugins)
+	}
+}
+
+func TestSaveForRootDoesNotWriteUserAgentSettingsIntoProjectConfig(t *testing.T) {
+	isolateUserConfigHome(t)
+	root := t.TempDir()
+	userPath := UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte("[agent]\ntemperature = 0.42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(root, "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[permissions]\nallow = [\"Bash(go test:*)\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadForRoot(root)
+	if err != nil {
+		t.Fatalf("LoadForRoot: %v", err)
+	}
+	if cfg.Agent.Temperature != 0.42 {
+		t.Fatalf("runtime temperature = %v, want merged user config", cfg.Agent.Temperature)
+	}
+	if err := cfg.SaveForRoot(root); err != nil {
+		t.Fatalf("SaveForRoot: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if strings.Contains(string(body), "temperature") {
+		t.Fatalf("user agent setting leaked into project config:\n%s", body)
 	}
 }
 

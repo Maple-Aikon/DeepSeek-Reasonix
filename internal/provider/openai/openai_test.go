@@ -125,6 +125,106 @@ func TestStreamAuthError(t *testing.T) {
 	}
 }
 
+func TestStreamUsesConfiguredChatURL(t *testing.T) {
+	var sawRequest bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if r.URL.Path != "/proxy/v1/chat/completions" {
+			t.Errorf("path = %s, want /proxy/v1/chat/completions", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer k" {
+			http.Error(w, "bad key", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{
+		Name:    "custom",
+		BaseURL: srv.URL + "/base",
+		Model:   "model-a",
+		APIKey:  "k",
+		Extra:   map[string]any{"chat_url": srv.URL + "/proxy/v1/chat/completions"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+		if chunk.Type == provider.ChunkText {
+			got.WriteString(chunk.Text)
+		}
+	}
+	if !sawRequest {
+		t.Fatal("server did not receive request")
+	}
+	if got.String() != "ok" {
+		t.Fatalf("streamed text = %q, want ok", got.String())
+	}
+}
+
+func TestStreamSendsCustomHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer real-key" {
+			http.Error(w, "authorization was not preserved", http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get("HTTP-Referer") != "https://app.example" || r.Header.Get("X-Title") != "Reasonix" {
+			http.Error(w, "custom headers missing", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Accept") != "text/event-stream" {
+			http.Error(w, "reserved Accept header was overwritten", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{
+		Name:    "custom",
+		BaseURL: srv.URL,
+		Model:   "model-a",
+		APIKey:  "real-key",
+		Extra: map[string]any{"headers": map[string]string{
+			"Authorization": "Bearer wrong",
+			"Accept":        "application/json",
+			"HTTP-Referer":  "https://app.example",
+			"X-Title":       "Reasonix",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+	}
+}
+
 // TestBuildRequestAlwaysSerializesContent guards the DeepSeek 400 regression:
 // DeepSeek rejects a message missing the `content` field, so every message must
 // serialize one. A pure tool_calls assistant turn carries null (OpenAI-spec,
@@ -310,6 +410,32 @@ func TestBuildRequestDropsReasoningOnPlainAssistantTurn(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "the answer") {
 		t.Errorf("assistant content was dropped along with reasoning: %s", b)
+	}
+}
+
+func TestBuildRequestDropsMemoryCitations(t *testing.T) {
+	c := &client{model: "deepseek-chat", deepseek: true}
+	req := c.buildRequest(provider.Request{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: "continue"},
+			{Role: provider.RoleUser, Content: "edited prompt", Edited: true, Original: "original prompt"},
+			{Role: provider.RoleAssistant, Content: "done", MemoryCitations: []provider.MemoryCitation{{
+				ID: "mem-1", Source: "MEMORY.md", LineStart: 116, LineEnd: 123, Note: "workflow",
+			}}},
+		},
+	})
+	b, err := json.Marshal(req.Messages)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "memoryCitations") || strings.Contains(string(b), "MEMORY.md") {
+		t.Fatalf("local memory citations leaked into OpenAI-compatible request: %s", b)
+	}
+	if strings.Contains(string(b), "original prompt") || strings.Contains(string(b), `"edited"`) || strings.Contains(string(b), `"original"`) {
+		t.Fatalf("local edit metadata leaked into OpenAI-compatible request: %s", b)
+	}
+	if !strings.Contains(string(b), "done") {
+		t.Fatalf("assistant content was dropped with local metadata: %s", b)
 	}
 }
 
@@ -611,5 +737,62 @@ func TestBuildRequestContentNullForAssistantToolCalls(t *testing.T) {
 	}
 	if !strings.Contains(s, `"parameters":{"type":"object"}`) {
 		t.Errorf("no-param tool should serialize a valid empty-object schema: %s", s)
+	}
+}
+
+func TestBuildRequestOmitsResponseOnlyToolCallIndex(t *testing.T) {
+	c := &client{name: "x", model: "m", baseURL: "https://api.example.com/v1"}
+	req := provider.Request{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			ToolCalls: []provider.ToolCall{{
+				ID:        "call_1",
+				Name:      "bash",
+				Arguments: `{"cmd":"ls"}`,
+			}},
+		}},
+	}
+	body, err := json.Marshal(c.buildRequest(req))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(body)
+	if !strings.Contains(s, `"tool_calls"`) {
+		t.Fatalf("request body missing tool call: %s", s)
+	}
+	if strings.Contains(s, `"index"`) {
+		t.Fatalf("request body contains response-only tool_call index: %s", s)
+	}
+}
+
+func TestBuildRequestOmitsEmptyToolDescriptionAndParameters(t *testing.T) {
+	c := &client{name: "x", model: "m", baseURL: "https://api.example.com/v1"}
+	req := provider.Request{
+		Tools: []provider.ToolSchema{{Name: "noargs"}},
+	}
+	body, err := json.Marshal(c.buildRequest(req))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Tools []struct {
+			Function map[string]json.RawMessage `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal request: %v\n%s", err, body)
+	}
+	if len(wire.Tools) != 1 {
+		t.Fatalf("tools = %d, want 1: %s", len(wire.Tools), body)
+	}
+	fn := wire.Tools[0].Function
+	if string(fn["name"]) != `"noargs"` {
+		t.Fatalf("function name = %s, want noargs", fn["name"])
+	}
+	if _, ok := fn["description"]; ok {
+		t.Fatalf("empty description should be omitted: %s", body)
+	}
+	if _, ok := fn["parameters"]; ok {
+		t.Fatalf("nil parameters should be omitted: %s", body)
 	}
 }

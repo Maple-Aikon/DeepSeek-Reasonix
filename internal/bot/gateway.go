@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"reasonix/internal/agent"
 	"reasonix/internal/boot"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
@@ -19,9 +18,14 @@ import (
 
 // GatewayConfig 是 BotGateway 的配置。
 type GatewayConfig struct {
-	Model              string
-	ToolApprovalMode   string
-	MaxSteps           int
+	Model            string
+	ToolApprovalMode string
+	MaxSteps         int
+	// ApprovalTimeout bounds how long a tool-approval/ask prompt blocks a bot
+	// session waiting for a remote user's reply. Zero falls back to
+	// defaultBotApprovalTimeout so an abandoned prompt can't wedge the bot forever
+	// (#4626, #4402). A negative value disables the timeout (wait indefinitely).
+	ApprovalTimeout    time.Duration
 	WorkspaceRoot      string
 	Channels           map[Platform]ChannelConfig
 	ConnectionChannels map[string]ChannelConfig
@@ -80,9 +84,21 @@ type BotGateway struct {
 	logger *slog.Logger
 }
 
+// botController is the slice of the controller's driving port the gateway needs:
+// session lifecycle, turn execution, and approval/ask handling. The bot never
+// touches goals, checkpoints, or memory, so it depends on those sub-ports only —
+// not the concrete *control.Controller and its ~99 methods.
+type botController interface {
+	control.Lifecycle
+	control.TurnControl
+	control.Approvals
+}
+
 type sessionState struct {
-	ctrl             *control.Controller
+	ctrl             botController
 	sink             *sessionEventSink
+	platform         Platform
+	connectionID     string
 	cancel           context.CancelFunc
 	pendingAsks      map[string][]event.AskQuestion
 	pendingApprovals map[string]event.Approval
@@ -322,7 +338,15 @@ func (gw *BotGateway) handleMessage(ctx context.Context, binding AdapterBinding,
 		return
 	}
 
-	gw.runTurn(ctx, binding.Adapter, key, msg)
+	// Run the turn on its own goroutine so the dispatch loop stays free to read
+	// the next inbound message. A turn that hits interactive approval/ask blocks
+	// inside RunTurn waiting for ctrl.Approve/AnswerQuestion — and the ONLY path
+	// that calls those is handleSlashCommand on this same dispatch goroutine. Run
+	// it inline and the loop can never deliver the /approve (or card) reply that
+	// would unblock it: the session wedges until restart (#4701, #4863, #4402).
+	// Per-session serialization is still held by the session lock (active[key]),
+	// which the deferred Release inside runTurn clears.
+	go gw.runTurn(ctx, binding.Adapter, key, msg)
 }
 
 func (gw *BotGateway) addPendingReaction(ctx context.Context, plat Platform, adapter Adapter, msg InboundMessage) {
@@ -667,7 +691,7 @@ func parseToolApprovalModeArg(arg string) (mode string, statusOnly bool, ok bool
 
 func (gw *BotGateway) setToolApprovalModeForMessage(key string, msg InboundMessage, mode string) error {
 	mode = normalizeBotToolApprovalMode(mode)
-	var ctrl *control.Controller
+	var ctrl botController
 
 	gw.mu.Lock()
 	if state, ok := gw.controllers[key]; ok {
@@ -708,7 +732,7 @@ func (gw *BotGateway) updateToolApprovalModeDefaultLocked(msg InboundMessage, mo
 }
 
 func (gw *BotGateway) currentToolApprovalMode(key string, msg InboundMessage) string {
-	var ctrl *control.Controller
+	var ctrl botController
 	gw.mu.Lock()
 	if state, ok := gw.controllers[key]; ok {
 		ctrl = state.ctrl
@@ -807,6 +831,9 @@ func (gw *BotGateway) runTurn(ctx context.Context, adapter Adapter, key string, 
 			gw.mu.Unlock()
 		},
 	)
+	// Finish initializing the sink before publishing it as the live target: once
+	// setTarget runs, other goroutines can reach this sink via state.sink.Emit.
+	sink.ctrl = state.ctrl
 	state.sink.setTarget(sink)
 	defer state.sink.setTarget(nil)
 
@@ -820,7 +847,6 @@ func (gw *BotGateway) runTurn(ctx context.Context, adapter Adapter, key string, 
 	gw.mu.Unlock()
 
 	// 运行一轮对话
-	sink.ctrl = state.ctrl
 	err := state.ctrl.RunTurn(turnCtx, input)
 	sink.Emit(event.Event{Kind: event.TurnDone, Err: err})
 	if err != nil {
@@ -833,6 +859,12 @@ func (gw *BotGateway) runTurn(ctx context.Context, adapter Adapter, key string, 
 func (gw *BotGateway) getOrCreateSession(ctx context.Context, key string, msg InboundMessage) *sessionState {
 	gw.mu.Lock()
 	if state, ok := gw.controllers[key]; ok {
+		if state.connectionID == "" {
+			state.connectionID = strings.TrimSpace(msg.ConnectionID)
+		}
+		if state.platform == "" {
+			state.platform = msg.Platform
+		}
 		state.lastActive = time.Now()
 		gw.mu.Unlock()
 		gw.logger.Info("bot session reused", "platform", msg.Platform, "chat_type", msg.ChatType, "chat", hashID(msg.ChatID), "session", key[:8])
@@ -845,12 +877,13 @@ func (gw *BotGateway) getOrCreateSession(ctx context.Context, key string, msg In
 	model, workspaceRoot, toolApprovalMode := gw.sessionOptionsForMessage(msg)
 	gw.logger.Info("bot session creating", "platform", msg.Platform, "chat_type", msg.ChatType, "chat", hashID(msg.ChatID), "session", key[:8], "model", model, "workspace_set", strings.TrimSpace(workspaceRoot) != "", "tool_approval_mode", normalizeBotToolApprovalMode(toolApprovalMode))
 	ctrl, err := boot.Build(ctx, boot.Options{
-		Model:         model,
-		MaxSteps:      gw.cfg.MaxSteps,
-		RequireKey:    true,
-		Sink:          sessionSink,
-		WorkspaceRoot: workspaceRoot,
-		SessionDir:    botSessionDir(workspaceRoot),
+		Model:           model,
+		MaxSteps:        gw.cfg.MaxSteps,
+		RequireKey:      true,
+		Sink:            sessionSink,
+		WorkspaceRoot:   workspaceRoot,
+		SessionDir:      botSessionDir(workspaceRoot),
+		ApprovalTimeout: gw.approvalTimeout(),
 	})
 	if err != nil {
 		gw.logger.Error("build controller failed", "err", err)
@@ -858,28 +891,54 @@ func (gw *BotGateway) getOrCreateSession(ctx context.Context, key string, msg In
 	}
 	ctrl.EnableInteractiveApproval()
 	ctrl.SetToolApprovalMode(toolApprovalMode)
-	ensureControllerSessionPath(ctrl)
+	ctrl.EnsureSessionPath()
 
 	gw.mu.Lock()
-	gw.controllers[key] = &sessionState{
-		ctrl:        ctrl,
-		sink:        sessionSink,
-		pendingAsks: make(map[string][]event.AskQuestion),
-		createdAt:   time.Now(),
-		lastActive:  time.Now(),
+	// Re-check under the lock: while we were off-lock in boot.Build, a second
+	// message for the same key may have built and registered its own session.
+	// The first writer wins; close the controller we just built (releasing its
+	// jobs/plugin host) and reuse the existing one, so a near-simultaneous pair
+	// of opening messages can't leak a controller.
+	if existing, ok := gw.controllers[key]; ok {
+		existing.lastActive = time.Now()
+		gw.mu.Unlock()
+		ctrl.Close()
+		gw.logger.Info("bot session built concurrently; discarding duplicate", "platform", msg.Platform, "chat", hashID(msg.ChatID), "session", key[:8])
+		return existing
 	}
-	state := gw.controllers[key]
+	state := &sessionState{
+		ctrl:         ctrl,
+		sink:         sessionSink,
+		platform:     msg.Platform,
+		connectionID: strings.TrimSpace(msg.ConnectionID),
+		pendingAsks:  make(map[string][]event.AskQuestion),
+		createdAt:    time.Now(),
+		lastActive:   time.Now(),
+	}
+	gw.controllers[key] = state
 	gw.mu.Unlock()
 
 	gw.logger.Info("bot session created", "platform", msg.Platform, "chat_type", msg.ChatType, "chat", hashID(msg.ChatID), "session", key[:8])
 	return state
 }
 
-func ensureControllerSessionPath(ctrl *control.Controller) {
-	if ctrl == nil || ctrl.SessionPath() != "" || ctrl.SessionDir() == "" {
-		return
+// defaultBotApprovalTimeout caps how long a bot session waits for a remote
+// user's approval/ask reply before treating it as denied, so an abandoned
+// prompt (or a dropped IM event) can't leave the session wedged forever
+// (#4626, #4402). 30 minutes is generous for a human reply yet bounded.
+const defaultBotApprovalTimeout = 30 * time.Minute
+
+// approvalTimeout resolves the configured bot approval wait: zero uses the
+// bounded default; a negative value opts out (wait indefinitely).
+func (gw *BotGateway) approvalTimeout() time.Duration {
+	switch {
+	case gw.cfg.ApprovalTimeout < 0:
+		return 0
+	case gw.cfg.ApprovalTimeout == 0:
+		return defaultBotApprovalTimeout
+	default:
+		return gw.cfg.ApprovalTimeout
 	}
-	ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
 }
 
 func botSessionDir(workspaceRoot string) string {
@@ -892,7 +951,7 @@ func botSessionDir(workspaceRoot string) string {
 	return config.SessionDir()
 }
 
-func (gw *BotGateway) rememberSessionReady(msg InboundMessage, ctrl *control.Controller) {
+func (gw *BotGateway) rememberSessionReady(msg InboundMessage, ctrl botController) {
 	if gw.cfg.OnSessionReady == nil || ctrl == nil {
 		return
 	}
@@ -1039,4 +1098,77 @@ func normalizeAskSelection(q event.AskQuestion, raw string) []string {
 		out = append(out, part)
 	}
 	return out
+}
+
+// UpdateConnectionToolApprovalMode updates the in-memory tool approval mode for
+// a single bot connection without restarting the gateway. Empty mode clears the
+// connection override, so existing sessions inherit the current gateway default.
+func (gw *BotGateway) UpdateConnectionToolApprovalMode(connID, mode string) {
+	connID = strings.TrimSpace(connID)
+	if connID == "" {
+		return
+	}
+	mode = normalizeOptionalBotToolApprovalMode(mode)
+	type controllerMode struct {
+		ctrl botController
+		mode string
+	}
+	var updates []controllerMode
+
+	gw.mu.Lock()
+	if gw.cfg.ConnectionChannels == nil {
+		gw.cfg.ConnectionChannels = make(map[string]ChannelConfig)
+	}
+	ch := gw.cfg.ConnectionChannels[connID]
+	ch.ToolApprovalMode = mode
+	gw.cfg.ConnectionChannels[connID] = ch
+	// Update every active session that belongs to this connection.
+	for _, state := range gw.controllers {
+		if state == nil || state.ctrl == nil || strings.TrimSpace(state.connectionID) != connID {
+			continue
+		}
+		effectiveMode := mode
+		if effectiveMode == "" {
+			_, _, effectiveMode = gw.sessionOptionsForMessage(InboundMessage{
+				Platform:     state.platform,
+				ConnectionID: state.connectionID,
+			})
+		}
+		updates = append(updates, controllerMode{ctrl: state.ctrl, mode: effectiveMode})
+	}
+	gw.mu.Unlock()
+
+	for _, update := range updates {
+		update.ctrl.SetToolApprovalMode(update.mode)
+	}
+}
+
+// SendToAdapter sends a message through the adapter identified by connID.
+// Returns an error if no matching adapter is found.
+func (gw *BotGateway) SendToAdapter(ctx context.Context, connID, domain string, msg OutboundMessage) (SendResult, error) {
+	connID = strings.TrimSpace(connID)
+	domain = strings.TrimSpace(domain)
+	var adapter Adapter
+	gw.mu.Lock()
+	for _, binding := range gw.adapters {
+		if strings.TrimSpace(binding.ID) == connID &&
+			(domain == "" || strings.EqualFold(strings.TrimSpace(binding.Domain), domain)) {
+			adapter = binding.Adapter
+			break
+		}
+	}
+	gw.mu.Unlock()
+	if adapter != nil {
+		return adapter.Send(ctx, msg)
+	}
+	return SendResult{}, fmt.Errorf("SendToAdapter: no adapter found for connection %q (domain %q)", connID, domain)
+}
+
+// SendTextToAdapter sends a plain text message through the adapter identified by connID.
+func (gw *BotGateway) SendTextToAdapter(ctx context.Context, connID, domain, chatID string, chatType ChatType, text string) (SendResult, error) {
+	return gw.SendToAdapter(ctx, connID, domain, OutboundMessage{
+		ChatID:   chatID,
+		ChatType: chatType,
+		Text:     text,
+	})
 }

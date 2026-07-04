@@ -69,6 +69,8 @@ type configurableFactory struct {
 	withHooks  bool
 	hookEvents []hook.Event
 	behavior   func(ctx context.Context, sink event.Sink, input string, p SessionParams) error
+	managers   []*jobs.Manager
+	withCtrl   func(ctx context.Context, sink event.Sink, input string, p SessionParams, ctrl *control.Controller) error
 }
 
 func (f *configurableFactory) NewSession(_ context.Context, p SessionParams) (*control.Controller, error) {
@@ -86,18 +88,68 @@ func (f *configurableFactory) NewSession(_ context.Context, p SessionParams) (*c
 			return nil
 		}
 	}
+	var ctrl *control.Controller
 	runner := &fakeRunner{
-		sink:     p.Sink,
-		behavior: func(ctx context.Context, sink event.Sink, input string) error { return behavior(ctx, sink, input, p) },
+		sink: p.Sink,
+		behavior: func(ctx context.Context, sink event.Sink, input string) error {
+			if f.withCtrl != nil {
+				return f.withCtrl(ctx, sink, input, p, ctrl)
+			}
+			return behavior(ctx, sink, input, p)
+		},
 	}
 	opts := control.Options{Runner: runner, Sink: p.Sink, SessionDir: f.dir}
 	if f.withHooks {
 		opts.Hooks = f.hookRunner()
 	}
-	return control.New(opts), nil
+	if f.managers != nil {
+		jm := jobs.NewManager(event.Discard)
+		f.mu.Lock()
+		f.managers = append(f.managers, jm)
+		f.mu.Unlock()
+		opts.Jobs = jm
+	}
+	ctrl = control.New(opts)
+	return ctrl, nil
 }
 
 func (f *configurableFactory) SessionDir() string { return f.dir }
+
+type teardownFactory struct {
+	dir     string
+	grace   time.Duration
+	mu      sync.Mutex
+	manager *jobs.Manager
+}
+
+func (f *teardownFactory) SessionDir() string { return f.dir }
+
+func (f *teardownFactory) NewSession(_ context.Context, p SessionParams) (*control.Controller, error) {
+	jm := jobs.NewManager(event.Discard, jobs.WithTeardownGrace(f.grace))
+	f.mu.Lock()
+	f.manager = jm
+	f.mu.Unlock()
+	runner := &fakeRunner{
+		sink:     p.Sink,
+		behavior: func(context.Context, event.Sink, string) error { return nil },
+	}
+	return control.New(control.Options{
+		Runner:     runner,
+		Sink:       p.Sink,
+		SessionDir: f.dir,
+		Jobs:       jm,
+	}), nil
+}
+
+func (f *teardownFactory) lastManager(t *testing.T) *jobs.Manager {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.manager == nil {
+		t.Fatal("session manager was not created")
+	}
+	return f.manager
+}
 
 func (f *configurableFactory) SessionConfigState(_ context.Context, p SessionConfigStateParams) (SessionConfigState, error) {
 	model := strings.TrimSpace(p.Model)
@@ -148,6 +200,19 @@ func (f *configurableFactory) buildCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.builds)
+}
+
+func (f *configurableFactory) managerAt(t *testing.T, idx int) *jobs.Manager {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.managers == nil {
+		t.Fatal("factory does not create job managers")
+	}
+	if len(f.managers) <= idx {
+		t.Fatalf("builds = %d, want manager index %d", len(f.builds), idx)
+	}
+	return f.managers[idx]
 }
 
 func (f *configurableFactory) hookRunner() *hook.Runner {
@@ -319,6 +384,44 @@ func updateKind(t *testing.T, f frame) string {
 		t.Fatalf("decode update: %v", err)
 	}
 	return p.Update.SessionUpdate
+}
+
+func configOptionValueFromUpdate(t *testing.T, f frame, id string) (string, bool) {
+	t.Helper()
+	var p struct {
+		Update struct {
+			SessionUpdate string                `json:"sessionUpdate"`
+			ConfigOptions []SessionConfigOption `json:"configOptions"`
+		} `json:"update"`
+	}
+	if err := json.Unmarshal(f.Params, &p); err != nil {
+		t.Fatalf("decode config update: %v", err)
+	}
+	if p.Update.SessionUpdate != "config_option_update" {
+		return "", false
+	}
+	opt, ok := findConfigOption(p.Update.ConfigOptions, id)
+	if !ok {
+		return "", false
+	}
+	return opt.CurrentValue, true
+}
+
+func messageChunkText(t *testing.T, f frame) (string, bool) {
+	t.Helper()
+	var p struct {
+		Update struct {
+			SessionUpdate string       `json:"sessionUpdate"`
+			Content       ContentBlock `json:"content"`
+		} `json:"update"`
+	}
+	if err := json.Unmarshal(f.Params, &p); err != nil {
+		t.Fatalf("decode message update: %v", err)
+	}
+	if p.Update.SessionUpdate != "agent_message_chunk" || p.Update.Content.Type != "text" {
+		return "", false
+	}
+	return p.Update.Content.Text, true
 }
 
 // --- tests ---
@@ -597,6 +700,271 @@ func TestServeSessionConfigQueuesDuringActivePrompt(t *testing.T) {
 	}
 }
 
+func TestServeSessionConfigRejectsBackgroundJobsWhileIdle(t *testing.T) {
+	dir := t.TempDir()
+	factory := &configurableFactory{dir: dir, managers: []*jobs.Manager{}}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil {
+		t.Fatalf("session/new result: %v", err)
+	}
+
+	jm := factory.managerAt(t, 0)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	started := make(chan struct{})
+	sessionPath := transcriptPath(dir, nr.SessionID)
+	jm.StartForSession(agent.BranchID(sessionPath), "bash", "server", func(ctx context.Context, _ io.Writer) (string, error) {
+		close(started)
+		select {
+		case <-release:
+			return "", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	})
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		jm.Close()
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background job never started")
+	}
+
+	setResp := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "model",
+		Value:     "pro",
+	})
+	if setResp.Error == nil || !strings.Contains(setResp.Error.Message, "stop background jobs") {
+		t.Fatalf("set_config_option with background job error = %+v, want stop background jobs RPC error", setResp.Error)
+	}
+	legacyResp := client.call(t, "session/set_model", SetSessionModelParams{SessionID: nr.SessionID, ModelID: "pro"})
+	if legacyResp.Error == nil || !strings.Contains(legacyResp.Error.Message, "stop background jobs") {
+		t.Fatalf("set_model with background job error = %+v, want stop background jobs RPC error", legacyResp.Error)
+	}
+	if got := factory.buildCount(); got != 1 {
+		t.Fatalf("build count after rejected switch = %d, want 1", got)
+	}
+	if running := jm.RunningForSession(agent.BranchID(sessionPath)); len(running) != 1 {
+		t.Fatalf("running jobs after rejected switch = %+v, want original job still running", running)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	_ = jm.WaitForSession(context.Background(), agent.BranchID(sessionPath), nil, 5)
+	if running := jm.RunningForSession(agent.BranchID(sessionPath)); len(running) != 0 {
+		t.Fatalf("running jobs after release = %+v, want none before retry", running)
+	}
+
+	retryResp := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "model",
+		Value:     "pro",
+	})
+	if retryResp.Error != nil {
+		t.Fatalf("retry set_config_option after jobs stopped errored: %+v", retryResp.Error)
+	}
+	var retry SetSessionConfigOptionResult
+	if err := json.Unmarshal(retryResp.Result, &retry); err != nil {
+		t.Fatalf("retry set_config_option result: %v", err)
+	}
+	modelOpt, _ := findConfigOption(retry.ConfigOptions, "model")
+	if modelOpt.CurrentValue != "pro" {
+		t.Fatalf("retry model currentValue = %q, want pro", modelOpt.CurrentValue)
+	}
+	if got := factory.buildCount(); got != 2 {
+		t.Fatalf("build count after retry switch = %d, want rebuild", got)
+	}
+
+	promptCh := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "after-switch"}},
+	})
+	notifs, resp := drainPrompt(t, client, promptCh)
+	if resp.Error != nil {
+		t.Fatalf("prompt after retry switch errored: %+v", resp.Error)
+	}
+	var usedNewModel bool
+	for _, n := range notifs {
+		if text, ok := messageChunkText(t, n); ok && strings.Contains(text, "pro:after-switch") {
+			usedNewModel = true
+			break
+		}
+	}
+	if !usedNewModel {
+		t.Fatalf("prompt after retry did not use new model; notifications=%+v", notifs)
+	}
+}
+
+func TestServeQueuedSessionConfigDiscardedWhenPromptLeavesBackgroundJob(t *testing.T) {
+	dir := t.TempDir()
+	releaseJob := make(chan struct{})
+	releaseTurn := make(chan struct{})
+	startedJob := make(chan struct{})
+	startedTurn := make(chan struct{})
+	var jobOnce sync.Once
+	factory := &configurableFactory{dir: dir, managers: []*jobs.Manager{}}
+	factory.behavior = func(ctx context.Context, sink event.Sink, input string, p SessionParams) error {
+		if input == "first" {
+			close(startedTurn)
+			jm := factory.managerAt(t, 0)
+			jobOnce.Do(func() {
+				jm.StartForSession(jobs.SessionFromContext(ctx), "bash", "server", func(ctx context.Context, _ io.Writer) (string, error) {
+					close(startedJob)
+					select {
+					case <-releaseJob:
+						return "", nil
+					case <-ctx.Done():
+						return "", ctx.Err()
+					}
+				})
+			})
+			select {
+			case <-startedJob:
+			case <-time.After(2 * time.Second):
+				t.Fatal("background job never started")
+			}
+			select {
+			case <-releaseTurn:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		sink.Emit(event.Event{Kind: event.Text, Text: p.Model + ":" + input})
+		return nil
+	}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil {
+		t.Fatalf("session/new result: %v", err)
+	}
+
+	first := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "first"}},
+	})
+	select {
+	case <-startedTurn:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt never started")
+	}
+	setResp := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "model",
+		Value:     "pro",
+	})
+	if setResp.Error != nil {
+		t.Fatalf("set_config_option while prompt is running errored: %+v", setResp.Error)
+	}
+
+	close(releaseTurn)
+	notifs, resp := drainPrompt(t, client, first)
+	if resp.Error != nil {
+		t.Fatalf("first prompt errored: %+v", resp.Error)
+	}
+	warningIndex := -1
+	for i, n := range notifs {
+		if text, ok := messageChunkText(t, n); ok && strings.Contains(text, "stop background jobs") {
+			warningIndex = i
+			break
+		}
+	}
+	if warningIndex < 0 {
+		t.Fatalf("queued switch updates = %d, want warning mentioning background jobs", len(notifs))
+	}
+	var sawOldConfig bool
+	for _, n := range notifs[warningIndex+1:] {
+		if value, ok := configOptionValueFromUpdate(t, n, "model"); ok && value == "fast" {
+			sawOldConfig = true
+			break
+		}
+	}
+	if !sawOldConfig {
+		t.Fatalf("queued switch notifications after warning did not include model currentValue=fast: %+v", notifs[warningIndex+1:])
+	}
+
+	close(releaseJob)
+	jm := factory.managerAt(t, 0)
+	_ = jm.WaitForSession(context.Background(), agent.BranchID(transcriptPath(dir, nr.SessionID)), nil, 5)
+	second := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "second"}},
+	})
+	_, resp = drainPrompt(t, client, second)
+	if resp.Error != nil {
+		t.Fatalf("second prompt errored: %+v", resp.Error)
+	}
+	if got := factory.buildCount(); got != 1 {
+		t.Fatalf("build count after discarded queued switch = %d, want 1", got)
+	}
+}
+
+func TestServeSessionConfigRejectsPendingAsk(t *testing.T) {
+	factory := &configurableFactory{
+		withCtrl: func(ctx context.Context, _ event.Sink, _ string, _ SessionParams, ctrl *control.Controller) error {
+			_, err := ctrl.Ask(ctx, []event.AskQuestion{{
+				ID:      "choice",
+				Prompt:  "Pick one",
+				Options: []event.AskOption{{Label: "A"}, {Label: "B"}},
+			}})
+			return err
+		},
+	}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil {
+		t.Fatalf("session/new result: %v", err)
+	}
+
+	promptCh := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "ask"}},
+	})
+	var req frame
+	select {
+	case req = <-client.reqs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask request was not sent to client")
+	}
+
+	setResp := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "model",
+		Value:     "pro",
+	})
+	if setResp.Error == nil || !strings.Contains(setResp.Error.Message, "pending") {
+		t.Fatalf("set_config_option with pending ask error = %+v, want pending interaction RPC error", setResp.Error)
+	}
+	if got := factory.buildCount(); got != 1 {
+		t.Fatalf("build count while ask is pending = %d, want 1", got)
+	}
+
+	client.reply(req.ID, PermissionRequestResult{
+		Outcome: PermissionOutcome{Outcome: "selected", OptionID: "choice:1"},
+	})
+	_, resp := drainPrompt(t, client, promptCh)
+	if resp.Error != nil {
+		t.Fatalf("prompt errored: %+v", resp.Error)
+	}
+	if got := factory.buildCount(); got != 1 {
+		t.Fatalf("build count after answered ask = %d, want no queued rebuild", got)
+	}
+}
+
 func TestServeSessionConfigRebuildPreservesLifecycleHooks(t *testing.T) {
 	factory := &configurableFactory{withHooks: true}
 	client, stop := startServer(t, factory)
@@ -694,6 +1062,45 @@ func TestServeSessionLoadFallsBackFromStaleSavedModel(t *testing.T) {
 	}
 	if meta.Model != "fast" {
 		t.Fatalf("rewritten meta model = %q, want fast", meta.Model)
+	}
+}
+
+func TestServeSessionLoadRejectsCleanupPending(t *testing.T) {
+	dir := t.TempDir()
+	cwd := t.TempDir()
+	sessionID := "pending-load"
+	path := transcriptPath(dir, sessionID)
+	saved := agent.NewSession("")
+	saved.Add(provider.Message{Role: provider.RoleUser, Content: "hello"})
+	if err := saved.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveACPMeta(path, acpSessionMeta{
+		SessionID: sessionID,
+		Cwd:       cwd,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.MarkCleanupPending(path, "delete"); err != nil {
+		t.Fatal(err)
+	}
+
+	factory := &configurableFactory{dir: dir}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	loadResp := client.call(t, "session/load", SessionLoadParams{SessionID: sessionID, Cwd: cwd})
+	if loadResp.Error == nil || !strings.Contains(loadResp.Error.Message, "unknown session") {
+		t.Fatalf("session/load cleanup-pending error = %+v, want unknown session", loadResp.Error)
+	}
+	factory.mu.Lock()
+	builds := append([]SessionParams(nil), factory.builds...)
+	factory.mu.Unlock()
+	if len(builds) != 0 {
+		t.Fatalf("cleanup-pending load should not build a controller, got builds %+v", builds)
 	}
 }
 
@@ -835,6 +1242,52 @@ func TestServeSessionClose(t *testing.T) {
 	}
 }
 
+func TestSessionDeleteWithStuckJobReturnsAfterSingleGrace(t *testing.T) {
+	dir := t.TempDir()
+	grace := time.Second
+	maxElapsed := grace + 750*time.Millisecond
+	factory := &teardownFactory{dir: dir, grace: grace}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil || nr.SessionID == "" {
+		t.Fatalf("session/new: %v (%q)", err, nr.SessionID)
+	}
+	path := transcriptPath(dir, nr.SessionID)
+	if err := os.WriteFile(path, []byte(`{"role":"user","content":"hello"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	releaseJob := startNonCooperativeACPJob(t, factory.lastManager(t), path)
+	defer releaseJob()
+
+	start := time.Now()
+	resp := client.call(t, "session/delete", SessionDeleteParams{SessionID: nr.SessionID})
+	elapsed := time.Since(start)
+	if resp.Error != nil {
+		t.Fatalf("session/delete errored: %+v", resp.Error)
+	}
+	if elapsed > maxElapsed {
+		t.Fatalf("session/delete took %s, want one teardown grace plus scheduling slack", elapsed)
+	}
+	if !agent.IsCleanupPending(path) {
+		t.Fatalf("stuck ACP delete should mark cleanup pending")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stuck ACP transcript should remain until delayed cleanup: %v", err)
+	}
+	releaseJob()
+	deadline := time.Now().Add(2 * time.Second)
+	for agent.IsCleanupPending(path) {
+		if time.Now().After(deadline) {
+			t.Fatalf("cleanup-pending marker was not cleared after stuck job release")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestServeRejectsPathLikeSessionID(t *testing.T) {
 	factory := &fakeFactory{behavior: func(context.Context, event.Sink, string) error { return nil }}
 	client, stop := startServer(t, factory)
@@ -846,6 +1299,38 @@ func TestServeRejectsPathLikeSessionID(t *testing.T) {
 	}
 	if resp.Error.Code != ErrInvalidParams || !strings.Contains(resp.Error.Message, "invalid sessionId") {
 		t.Fatalf("session/delete error = %+v, want invalid sessionId", resp.Error)
+	}
+}
+
+func TestListACPMetasSkipsCleanupPending(t *testing.T) {
+	dir := t.TempDir()
+	visibleID := "visible"
+	pendingID := "pending"
+	for _, id := range []string{visibleID, pendingID} {
+		path := transcriptPath(dir, id)
+		if err := os.WriteFile(path, []byte(`{"role":"user","content":"hi"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := saveACPMeta(path, acpSessionMeta{
+			SessionID: id,
+			Cwd:       t.TempDir(),
+			Title:     id,
+			CreatedAt: time.Now().UTC(),
+			UpdatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := agent.MarkCleanupPending(transcriptPath(dir, pendingID), "delete"); err != nil {
+		t.Fatal(err)
+	}
+
+	metas, err := listACPMetas(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 || metas[0].SessionID != visibleID {
+		t.Fatalf("listACPMetas = %+v, want only %q", metas, visibleID)
 	}
 }
 
@@ -879,6 +1364,36 @@ func TestDeleteSessionFilesDeletesOwnedSubagents(t *testing.T) {
 	}
 }
 
+func TestReconcileCleanupPendingDeletesACPMeta(t *testing.T) {
+	dir := t.TempDir()
+	sessionPath := transcriptPath(dir, "pending-acp")
+	if err := os.WriteFile(sessionPath, []byte(`{"role":"user","content":"hi"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveACPMeta(sessionPath, acpSessionMeta{Cwd: t.TempDir(), Model: "test-model"}); err != nil {
+		t.Fatal(err)
+	}
+	jobsDir := jobs.ArtifactDir(sessionPath)
+	if err := os.MkdirAll(jobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobsDir, "bash-1.log"), []byte("output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.MarkCleanupPending(sessionPath, "delete"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ReconcileCleanupPending(dir); err != nil {
+		t.Fatalf("ReconcileCleanupPending: %v", err)
+	}
+	for _, path := range []string{sessionPath, acpMetaPath(sessionPath), jobsDir, agent.CleanupPendingPath(sessionPath)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists after reconciliation (err=%v)", path, err)
+		}
+	}
+}
+
 func writeACPSubagentArtifact(t *testing.T, dir, ref, parentSession string) {
 	t.Helper()
 	subagentDir := filepath.Join(dir, "subagents")
@@ -900,6 +1415,31 @@ func writeACPSubagentArtifact(t *testing.T, dir, ref, parentSession string) {
 	}
 	if err := os.WriteFile(filepath.Join(subagentDir, ref+".meta.json"), data, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func startNonCooperativeACPJob(t *testing.T, jm *jobs.Manager, sessionPath string) func() {
+	t.Helper()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	jm.StartForSession(agent.BranchID(sessionPath), "bash", "stuck job", func(ctx context.Context, _ io.Writer) (string, error) {
+		close(started)
+		<-ctx.Done()
+		<-release
+		return "", ctx.Err()
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background job never started")
+	}
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		close(release)
 	}
 }
 

@@ -1,8 +1,10 @@
 package control
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"reasonix/internal/config"
@@ -43,7 +45,8 @@ type ArgData struct {
 // (everything after the command word). It returns the suggestions filtered by
 // the token being typed and the byte offset where that token begins, so a caller
 // replaces just that token. Only structured commands participate (/mcp /model
-// /skills /hooks /effort /auto-plan /reasoning-language /theme /language);
+// /skills /hooks /effort /auto-plan /goal /reasoning-language /memory-v5
+// /theme /language);
 // others yield nil. Single source of truth for CLI + desktop.
 func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 	cmdEnd := strings.IndexAny(line, " \t")
@@ -69,8 +72,12 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = effortArgItems(prior, d)
 	case "/auto-plan":
 		raw = autoPlanArgItems(prior)
+	case "/goal":
+		raw = goalArgItems(prior)
 	case "/reasoning-language":
 		raw = reasoningLanguageArgItems(prior)
+	case "/memory-v5":
+		raw = memoryV5ArgItems(prior)
 	case "/theme":
 		raw = themeArgItems(prior)
 	case "/language":
@@ -79,6 +86,18 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		return nil, from
 	}
 	return filterSlash(raw, line, from, cur), from
+}
+
+func goalArgItems(prior []string) []SlashItem {
+	if len(prior) > 1 {
+		return nil
+	}
+	return []SlashItem{
+		{Label: "--research", Insert: "--research ", Hint: "force durable AutoResearch state"},
+		{Label: "--simple", Insert: "--simple ", Hint: "force lightweight Goal"},
+		{Label: "status", Insert: "status", Hint: "show active goal"},
+		{Label: "clear", Insert: "clear", Hint: "stop goal mode"},
+	}
 }
 
 func autoPlanArgItems(prior []string) []SlashItem {
@@ -99,6 +118,19 @@ func reasoningLanguageArgItems(prior []string) []SlashItem {
 		{Label: "auto", Insert: "auto", Hint: "follow conversation language"},
 		{Label: "zh", Insert: "zh", Hint: "prefer Chinese visible reasoning"},
 		{Label: "en", Insert: "en", Hint: "prefer English visible reasoning"},
+	}
+}
+
+func memoryV5ArgItems(prior []string) []SlashItem {
+	if len(prior) > 1 {
+		return nil
+	}
+	return []SlashItem{
+		{Label: "status", Insert: "status", Hint: "show current Memory v5 state"},
+		{Label: "off", Insert: "off", Hint: "disable Memory v5 for future turns"},
+		{Label: "observe", Insert: "observe", Hint: "learn without injecting IR"},
+		{Label: "compact", Insert: "compact", Hint: "inject compact execution contracts"},
+		{Label: "on", Insert: "on", Hint: "alias for compact"},
 	}
 }
 
@@ -364,8 +396,11 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		}
 	case "/memory":
 		c.notice(c.memoryListText())
+	case "/memory-v5":
+		c.memoryV5Notice(fields)
 	case "/migrate", "/migration":
-		migration.RunLegacyRescue(c.sink)
+		args := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+		migration.RunLegacyRescueCommand(args, c.sink)
 	case "/skill", "/skills":
 		sub := ""
 		if len(fields) >= 2 {
@@ -383,6 +418,16 @@ func (c *Controller) managementNotice(trimmed string) bool {
 			return true
 		}
 		c.notice(c.skillListText())
+	case "/reload-cmd":
+		if c.Running() {
+			c.notice("wait for the current turn to finish, then retry /reload-cmd")
+			return true
+		}
+		if err := c.ReloadCommands(context.Background()); err != nil {
+			c.notice("reload-cmd: " + err.Error())
+		} else {
+			c.notice("commands reloaded (" + strconv.Itoa(len(c.Commands())) + " available)")
+		}
 	case "/hooks":
 		sub := ""
 		if len(fields) >= 2 {
@@ -392,7 +437,7 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		case "", "list", "ls":
 			c.notice(c.hookListText())
 		case "trust":
-			root := c.cpRoot
+			root := c.workspaceRoot
 			if root == "" {
 				root, _ = os.Getwd()
 			}
@@ -419,6 +464,82 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		return false
 	}
 	return true
+}
+
+func (c *Controller) memoryV5Notice(fields []string) {
+	if len(fields) > 2 {
+		c.notice("usage: /memory-v5 off|observe|compact|on|status")
+		return
+	}
+	if len(fields) < 2 || strings.EqualFold(fields[1], "status") {
+		cfg, err := config.Load()
+		if err != nil {
+			c.notice("memory-v5: " + err.Error())
+			return
+		}
+		c.notice(fmt.Sprintf("memory-v5: %s (usage: /memory-v5 off|observe|compact|on|status)", memoryV5Mode(cfg.MemoryCompilerEnabled(), cfg.MemoryCompilerVerbosity())))
+		return
+	}
+	if c.Running() {
+		c.notice("finish or cancel the current turn before changing memory-v5")
+		return
+	}
+	setting, err := parseMemoryV5Setting(fields[1])
+	if err != nil {
+		c.notice("memory-v5: " + err.Error())
+		return
+	}
+	path := config.UserConfigPath()
+	if path == "" {
+		c.notice("memory-v5: cannot resolve config path")
+		return
+	}
+	edit := config.LoadForEdit(path)
+	if err := edit.SetMemoryCompilerEnabled(setting.enabled); err != nil {
+		c.notice("memory-v5: " + err.Error())
+		return
+	}
+	if setting.setVerbosity {
+		if err := edit.SetMemoryCompilerVerbosity(setting.verbosity); err != nil {
+			c.notice("memory-v5: " + err.Error())
+			return
+		}
+	}
+	if err := edit.SaveTo(path); err != nil {
+		c.notice("memory-v5: " + err.Error())
+		return
+	}
+	c.SetMemoryCompilerEnabled(setting.enabled)
+	if setting.setVerbosity {
+		c.SetMemoryCompilerVerbosity(setting.verbosity)
+	}
+	c.notice(fmt.Sprintf("memory-v5 set to %s", memoryV5Mode(edit.MemoryCompilerEnabled(), edit.MemoryCompilerVerbosity())))
+}
+
+type memoryV5Setting struct {
+	enabled      bool
+	verbosity    string
+	setVerbosity bool
+}
+
+func parseMemoryV5Setting(mode string) (memoryV5Setting, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "off":
+		return memoryV5Setting{enabled: false}, nil
+	case "observe", "silent", "minimal":
+		return memoryV5Setting{enabled: true, verbosity: config.MemoryCompilerVerbosityObserve, setVerbosity: true}, nil
+	case "on", "compact", "inject", "contract":
+		return memoryV5Setting{enabled: true, verbosity: config.MemoryCompilerVerbosityCompact, setVerbosity: true}, nil
+	default:
+		return memoryV5Setting{}, fmt.Errorf("memory-v5 %q: must be off|observe|compact|on|status", mode)
+	}
+}
+
+func memoryV5Mode(enabled bool, verbosity string) string {
+	if !enabled {
+		return "off"
+	}
+	return config.NormalizeMemoryCompilerVerbosity(verbosity)
 }
 
 func (c *Controller) modelListText() string {
@@ -502,18 +623,19 @@ func (c *Controller) providerSwitchText(name string) string {
 }
 
 func (c *Controller) memoryListText() string {
-	if c.mem == nil {
+	mem := c.memory.current()
+	if mem == nil {
 		return i18n.M.ListMemoryNone
 	}
-	saved := c.mem.Store.List()
-	archived := c.mem.Store.ListArchived()
-	if len(c.mem.Docs) == 0 && len(saved) == 0 && len(archived) == 0 {
+	saved := mem.Store.List()
+	archived := mem.Store.ListArchived()
+	if len(mem.Docs) == 0 && len(saved) == 0 && len(archived) == 0 {
 		return i18n.M.ListMemoryNone
 	}
 	var b strings.Builder
-	if len(c.mem.Docs) > 0 {
+	if len(mem.Docs) > 0 {
 		b.WriteString(i18n.M.ListMemoryHeader + "\n")
-		for _, d := range c.mem.Docs {
+		for _, d := range mem.Docs {
 			fmt.Fprintf(&b, "  (%s) %s\n", d.Scope, d.Path)
 		}
 	}
@@ -554,12 +676,13 @@ func memoryOneLine(s string) string {
 }
 
 func (c *Controller) skillListText() string {
-	if len(c.skills) == 0 {
+	skills := c.skills.discovered()
+	if len(skills) == 0 {
 		return i18n.M.ListSkillsNone
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, i18n.M.ListSkillsHeaderFmt+"\n", len(c.skills))
-	for _, s := range c.skills {
+	fmt.Fprintf(&b, i18n.M.ListSkillsHeaderFmt+"\n", len(skills))
+	for _, s := range skills {
 		tag := ""
 		if s.RunAs == "subagent" {
 			tag = " 🧬"
@@ -587,17 +710,18 @@ func (c *Controller) hookListText() string {
 }
 
 func (c *Controller) mcpListText() string {
-	if c.host == nil || (len(c.host.ServerNames()) == 0 && len(c.host.Failures()) == 0) {
+	names := c.mcp.serverNames()
+	if len(names) == 0 && len(c.mcp.failures()) == 0 {
 		return i18n.M.ListMcpNone
 	}
 	var b strings.Builder
-	if len(c.host.ServerNames()) > 0 {
+	if len(names) > 0 {
 		b.WriteString(i18n.M.ListMcpHeader + "\n")
-		for _, name := range c.host.ServerNames() {
+		for _, name := range names {
 			fmt.Fprintf(&b, "  %s\n", name)
 		}
 	}
-	if failures := c.host.Failures(); len(failures) > 0 {
+	if failures := c.mcp.failures(); len(failures) > 0 {
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
