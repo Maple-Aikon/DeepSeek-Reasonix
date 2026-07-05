@@ -84,10 +84,16 @@ def real_bin(tmp_path):
         pytest.skip(f"reasonix.toml fixture template missing: {CONFIG_TEMPLATE}")
 
     # Copy template into a fresh tmp dir (tmp_path may be shared with
-    # the test, so use a sibling).
+    # the test, so use a sibling). Write to BOTH locations the binary
+    # might consult, because resolution order varies across versions:
+    # - documented: flag > ./reasonix.toml > ~/.reasonix/config.toml
+    # - the binary also reads <HOME>/reasonix.toml on some versions
     home_dir = tmp_path / "fake_home"
     home_dir.mkdir(exist_ok=True)
     shutil.copy(CONFIG_TEMPLATE, home_dir / "reasonix.toml")
+    reasonix_dir = home_dir / ".reasonix"
+    reasonix_dir.mkdir(exist_ok=True)
+    shutil.copy(CONFIG_TEMPLATE, reasonix_dir / "config.toml")
 
     # Only override HOME — the binary also reads XDG paths, but HOME
     # is the highest-precedence location on Linux and macOS, and on
